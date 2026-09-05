@@ -1,7 +1,7 @@
 import "server-only";
 
 import { createHash, randomUUID } from "crypto";
-import { getDb } from "../db/client";
+import { getDb, withTransaction } from "../db/client";
 
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -15,37 +15,26 @@ function canonicalize(value: unknown): unknown {
   return value;
 }
 
-function ensureTable(): void {
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS security_audit_log (
-      event_id TEXT PRIMARY KEY,
-      ts TEXT NOT NULL,
-      rm_id TEXT,
-      event_type TEXT NOT NULL,
-      target TEXT NOT NULL,
-      client_id TEXT,
-      metadata TEXT NOT NULL,
-      prev_hash TEXT NOT NULL,
-      hash TEXT NOT NULL
-    );
-  `);
-}
-
-export function writeSecurityAuditEvent(input: {
+export async function writeSecurityAuditEvent(input: {
   rmId?: string;
   eventType: string;
   target: string;
   clientId?: string;
   metadata?: Record<string, string | number | boolean | null>;
-}): void {
-  ensureTable();
-  const db = getDb();
-  const append = db.transaction(() => {
-    const previous = db
-      .prepare(
-        "SELECT hash FROM security_audit_log ORDER BY rowid DESC LIMIT 1",
+}): Promise<void> {
+  await withTransaction(getDb(), async (client) => {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      ["security-audit-log"],
+    );
+    const previous = (
+      await client.query<{ hash: string }>(
+        `SELECT hash
+         FROM security_audit_log
+         ORDER BY chain_seq DESC
+         LIMIT 1`,
       )
-      .get() as { hash: string } | undefined;
+    ).rows[0];
     const event = {
       event_id: randomUUID(),
       ts: new Date().toISOString(),
@@ -60,21 +49,21 @@ export function writeSecurityAuditEvent(input: {
     const hash = createHash("sha256")
       .update(`${prevHash}\n${serialized}`)
       .digest("hex");
-    db.prepare(
+    await client.query(
       `INSERT INTO security_audit_log
        (event_id, ts, rm_id, event_type, target, client_id, metadata, prev_hash, hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      event.event_id,
-      event.ts,
-      event.rm_id,
-      event.event_type,
-      event.target,
-      event.client_id,
-      JSON.stringify(event.metadata),
-      prevHash,
-      hash,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        event.event_id,
+        event.ts,
+        event.rm_id,
+        event.event_type,
+        event.target,
+        event.client_id,
+        JSON.stringify(event.metadata),
+        prevHash,
+        hash,
+      ],
     );
   });
-  append.immediate();
 }

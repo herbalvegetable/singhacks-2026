@@ -6,22 +6,22 @@ export class ResourceNotFoundError extends Error {
   }
 }
 
-export function requireClientAccess(
+export async function requireClientAccess(
   repository: Repository,
   rmId: string,
   clientId: string,
-): void {
-  if (!repository.clientBelongsToRm(clientId, rmId)) {
+): Promise<void> {
+  if (!(await repository.clientBelongsToRm(clientId, rmId))) {
     throw new ResourceNotFoundError();
   }
 }
 
-export function requireSignalAccess(
+export async function requireSignalAccess(
   repository: Repository,
   rmId: string,
   signalId: string,
-): void {
-  if (!repository.signalBelongsToRm(signalId, rmId)) {
+): Promise<void> {
+  if (!(await repository.signalBelongsToRm(signalId, rmId))) {
     throw new ResourceNotFoundError();
   }
 }

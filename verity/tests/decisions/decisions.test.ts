@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import Database from "better-sqlite3";
+import { newDb } from "pg-mem";
 import { DecisionRequest } from "../../lib/contracts/decision";
 import {
   calculateAuditHash,
@@ -19,9 +19,11 @@ const sourceRef = {
   values: { market_value_usd: 100 },
 };
 
-function createRepository() {
-  const db = new Database(":memory:");
-  db.exec(`
+async function createRepository() {
+  const memory = newDb();
+  const { Pool } = memory.adapters.createPg();
+  const db = new Pool();
+  await db.query(`
     CREATE TABLE signals (
       signal_id TEXT PRIMARY KEY,
       client_id TEXT NOT NULL,
@@ -32,8 +34,33 @@ function createRepository() {
       payload TEXT NOT NULL,
       input_hash TEXT
     );
+    CREATE TABLE audit_log (
+      chain_seq BIGSERIAL UNIQUE NOT NULL,
+      entry_id TEXT PRIMARY KEY,
+      ts TEXT NOT NULL,
+      rm_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      before TEXT NOT NULL,
+      after TEXT,
+      reason_code TEXT,
+      reason_text TEXT,
+      confidence_at_decision INTEGER NOT NULL,
+      prompt_version TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      context_pack_hash TEXT,
+      source_refs TEXT NOT NULL,
+      prev_hash TEXT NOT NULL,
+      hash TEXT NOT NULL
+    );
   `);
-  return { db, repository: new Repository(db) };
+  return {
+    db,
+    repository: new Repository(db, { useAdvisoryLock: false }),
+  };
 }
 
 test("decision contracts require modification instructions and controlled rejection reasons", () => {
@@ -73,8 +100,8 @@ test("decision contracts require modification instructions and controlled reject
   );
 });
 
-test("audit entries form a deterministic SHA-256 chain", () => {
-  const { db, repository } = createRepository();
+test("audit entries form a deterministic SHA-256 chain", async () => {
+  const { db, repository } = await createRepository();
   const common = {
     rm_id: "RM-PO-0412",
     target_type: "narrative_recommendation" as const,
@@ -88,14 +115,14 @@ test("audit entries form a deterministic SHA-256 chain", () => {
     context_pack_hash: null,
     source_refs: [sourceRef],
   };
-  const first = repository.appendAuditEntry({
+  const first = await repository.appendAuditEntry({
     ...common,
     action: "accept",
     after: null,
     reason_code: null,
     reason_text: null,
   });
-  const second = repository.appendAuditEntry({
+  const second = await repository.appendAuditEntry({
     ...common,
     action: "modify",
     after: { instructions: "Reduce scope" },
@@ -115,18 +142,18 @@ test("audit entries form a deterministic SHA-256 chain", () => {
     calculateAuditHash(first.hash, secondWithoutHashes),
   );
   assert.equal(
-    repository.getLatestDecision(
+    (await repository.getLatestDecision(
       "narrative_recommendation",
       "SIG-1",
       "CL-0001",
-    )?.action,
+    ))?.action,
     "modify",
   );
-  db.close();
+  await db.end();
 });
 
-test("target resolution rejects a client ownership mismatch", () => {
-  const { db, repository } = createRepository();
+test("target resolution rejects a client ownership mismatch", async () => {
+  const { db, repository } = await createRepository();
   const signal: Signal = {
     signal_id: "SIG-OWNER",
     client_id: "CL-0001",
@@ -145,12 +172,12 @@ test("target resolution rejects a client ownership mismatch", () => {
     data_quality_flags: [],
     computed_at: "2026-01-02T00:00:00.000Z",
   };
-  db.prepare("INSERT INTO signals VALUES (?, ?, ?)").run(
+  await db.query("INSERT INTO signals VALUES ($1, $2, $3)", [
     signal.signal_id,
     signal.client_id,
     JSON.stringify(signal),
-  );
-  db.prepare("INSERT INTO narratives VALUES (?, ?, ?)").run(
+  ]);
+  await db.query("INSERT INTO narratives VALUES ($1, $2, $3)", [
     signal.client_id,
     JSON.stringify({
       [signal.signal_id]: {
@@ -167,18 +194,19 @@ test("target resolution rejects a client ownership mismatch", () => {
       },
     }),
     "persisted-hash",
-  );
+  ]);
 
-  assert.throws(
-    () =>
-      resolveDecisionTarget(
+  await assert.rejects(
+    async () => {
+      await resolveDecisionTarget(
         repository,
         "narrative_recommendation",
         signal.signal_id,
         "CL-9999",
-      ),
+      );
+    },
     (error: unknown) =>
       error instanceof DecisionTargetError && error.status === 403,
   );
-  db.close();
+  await db.end();
 });

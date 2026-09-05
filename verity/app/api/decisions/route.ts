@@ -43,7 +43,7 @@ function errorResponse(error: unknown) {
 export async function GET(request: NextRequest) {
   try {
     const session = await requireApiSession();
-    enforceRateLimit(request, {
+    await enforceRateLimit(request, {
       bucket: "decision-read",
       limit: 60,
       windowMs: 5 * 60_000,
@@ -55,14 +55,14 @@ export async function GET(request: NextRequest) {
       target_id: request.nextUrl.searchParams.get("target_id"),
     });
     const repository = new Repository();
-    requireClientAccess(repository, session.rmId, lookup.client_id);
-    const target = resolveDecisionTarget(
+    await requireClientAccess(repository, session.rmId, lookup.client_id);
+    const target = await resolveDecisionTarget(
       repository,
       lookup.target_type,
       lookup.target_id,
       lookup.client_id,
     );
-    const decision = repository.getLatestDecision(
+    const decision = await repository.getLatestDecision(
       target.target_type,
       target.target_id,
       target.client_id,
@@ -79,7 +79,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await requireApiSession();
     assertSameOrigin(request);
-    enforceRateLimit(request, {
+    await enforceRateLimit(request, {
       bucket: "decision-write",
       limit: 30,
       windowMs: 5 * 60_000,
@@ -88,14 +88,14 @@ export async function POST(request: NextRequest) {
     const raw: unknown = await request.json();
     const decision = DecisionRequest.parse(raw);
     const repository = new Repository();
-    requireClientAccess(repository, session.rmId, decision.client_id);
-    const target = resolveDecisionTarget(
+    await requireClientAccess(repository, session.rmId, decision.client_id);
+    const target = await resolveDecisionTarget(
       repository,
       decision.target_type,
       decision.target_id,
       decision.client_id,
     );
-    const entry = repository.appendAuditEntry(
+    const entry = await repository.appendAuditEntry(
       buildAuditEntryInput(decision, target, session.rmId),
     );
     return NextResponse.json(

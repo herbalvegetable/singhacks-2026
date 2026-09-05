@@ -110,6 +110,7 @@ const envelope: FeasibilityEnvelope = {
     investment_horizon_years: 10,
     liquidity_needs: "Medium",
     total_aum_usd: 1_000_000,
+    client_since: "2020-01-01",
   },
   asOf: "2026-08-26",
   baselineValueUsd: 1_000_000,

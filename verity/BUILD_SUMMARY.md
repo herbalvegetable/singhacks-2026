@@ -1,5 +1,10 @@
 # Verity Build Summary
 
+> Historical milestone snapshot. This file predates the Neon Postgres migration
+> and later implementation of authentication, event grounding, prioritization,
+> diversification, Copilot, decisions/audit, charts, and tests. See `README.md`
+> and `QUICKSTART.md` for the current system and deployment instructions.
+
 **Project**: Verity — Wealth Intelligence Workbench  
 **Built for**: SingHacks 2026, Track 1 (Julius Baer, Wealth Intelligence)  
 **Status**: ✅ **Core MVP Complete and Running**  

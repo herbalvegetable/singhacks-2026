@@ -64,20 +64,34 @@ function daysBetween(from: string, to: string): number {
   );
 }
 
-export function buildBookRiskFacts(
+export async function buildBookRiskFacts(
   repository = new Repository(),
   rmId?: string,
-): ClientRiskFacts[] {
-  const asOf = repository.getSnapshotDates().at(-1);
+): Promise<ClientRiskFacts[]> {
+  const asOf = (await repository.getSnapshotDates()).at(-1);
   if (!asOf) throw new Error("No portfolio snapshots available");
 
-  const clients = rmId
+  const clients = await (rmId
     ? repository.getClientsForRm(rmId)
-    : repository.getAllClients();
-  return clients.map((client) => {
-    const signals = repository.getSignalsForClient(client.client_id);
-    const narratives = repository.getNarrativesForClient(client.client_id);
-    const holdings = repository.getHoldingsForClient(client.client_id, asOf);
+    : repository.getAllClients());
+  return Promise.all(clients.map(async (client) => {
+    const [
+      signals,
+      narratives,
+      holdings,
+      cashNeeds,
+      commitments,
+      baseFacilities,
+      flags,
+    ] = await Promise.all([
+      repository.getSignalsForClient(client.client_id),
+      repository.getNarrativesForClient(client.client_id),
+      repository.getHoldingsForClient(client.client_id, asOf),
+      repository.getCashNeedsForClient(client.client_id),
+      repository.getCommitmentsForClient(client.client_id),
+      repository.getFacilitiesForClient(client.client_id),
+      repository.getClientDataQualityFlags(client.client_id),
+    ]);
     const valueByInstrument = new Map<
       string,
       { name: string; value: number }
@@ -97,17 +111,14 @@ export function buildBookRiskFacts(
     const largestHolding = [...valueByInstrument.values()].sort(
       (left, right) => right.value - left.value,
     )[0];
-    const cashNeeds = repository.getCashNeedsForClient(client.client_id);
-    const commitments = repository.getCommitmentsForClient(client.client_id);
-    const facilities = repository
-      .getFacilitiesForClient(client.client_id)
-      .map((facility) => ({
+    const facilities = await Promise.all(
+      baseFacilities.map(async (facility) => ({
         ...facility,
-        latest_snapshot: repository
-          .getFacilitySnapshots(facility.facility_id)
-          .at(-1),
-      }));
-    const flags = repository.getClientDataQualityFlags(client.client_id);
+        latest_snapshot: (
+          await repository.getFacilitySnapshots(facility.facility_id)
+        ).at(-1),
+      })),
+    );
     const generatedRiskAnalyses = signals
       .filter((signal) => signal.type === "risk")
       .map((signal) => ({
@@ -202,7 +213,7 @@ export function buildBookRiskFacts(
       })),
       valid_evidence_ref_ids: [...new Set(validEvidenceRefIds)],
     };
-  });
+  }));
 }
 
 export function hashBookRiskFacts(facts: ClientRiskFacts[]): string {
@@ -372,7 +383,7 @@ export async function generateBookRiskPriorities(
   prefetchedFacts?: ClientRiskFacts[],
 ): Promise<{ inputHash: string; priorities: StoredRiskPriority[] }> {
   requireAgentsEnabled();
-  const facts = prefetchedFacts ?? buildBookRiskFacts(repository);
+  const facts = prefetchedFacts ?? await buildBookRiskFacts(repository);
   const inputHash = hashBookRiskFacts(facts);
   const summaries = (await generateRiskSummaries(facts)).map((summary) => ({
     ...summary,

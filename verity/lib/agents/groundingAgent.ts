@@ -32,8 +32,8 @@ const GroundingDecision = z.object({
   confidence: z.number().int().min(0).max(100),
 });
 
-function words(value: string): string[] {
-  return value
+function words(value: unknown): string[] {
+  return String(value ?? "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .split(/\s+/)

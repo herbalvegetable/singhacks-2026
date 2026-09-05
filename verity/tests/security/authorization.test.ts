@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import Database from "better-sqlite3";
+import { newDb } from "pg-mem";
 import { Repository } from "../../lib/db/repository";
 import {
   requireClientAccess,
@@ -8,13 +8,16 @@ import {
   ResourceNotFoundError,
 } from "../../lib/security/access";
 
-function testRepository() {
-  const db = new Database(":memory:");
-  db.exec(`
+async function testRepository() {
+  const memory = newDb();
+  const { Pool } = memory.adapters.createPg();
+  const db = new Pool();
+  await db.query(`
     CREATE TABLE clients (
       client_id TEXT PRIMARY KEY,
       client_name TEXT,
-      rm_id TEXT
+      rm_id TEXT,
+      client_since TEXT
     );
     CREATE TABLE signals (
       signal_id TEXT PRIMARY KEY,
@@ -22,34 +25,38 @@ function testRepository() {
       payload TEXT
     );
   `);
-  db.prepare("INSERT INTO clients VALUES (?, ?, ?)").run(
+  await db.query("INSERT INTO clients VALUES ($1, $2, $3, $4)", [
     "CL-0001",
     "Client One",
     "RM-ONE",
-  );
-  db.prepare("INSERT INTO signals VALUES (?, ?, ?)").run(
+    "2020-01-01",
+  ]);
+  await db.query("INSERT INTO signals VALUES ($1, $2, $3)", [
     "SIG-ONE",
     "CL-0001",
     "{}",
-  );
-  return { db, repository: new Repository(db) };
+  ]);
+  return {
+    db,
+    repository: new Repository(db, { useAdvisoryLock: false }),
+  };
 }
 
-test("RM-scoped client and signal checks hide out-of-book resources", () => {
-  const { db, repository } = testRepository();
-  assert.doesNotThrow(() =>
-    requireClientAccess(repository, "RM-ONE", "CL-0001"),
+test("RM-scoped client and signal checks hide out-of-book resources", async () => {
+  const { db, repository } = await testRepository();
+  await assert.doesNotReject(async () =>
+    await requireClientAccess(repository, "RM-ONE", "CL-0001"),
   );
-  assert.doesNotThrow(() =>
-    requireSignalAccess(repository, "RM-ONE", "SIG-ONE"),
+  await assert.doesNotReject(async () =>
+    await requireSignalAccess(repository, "RM-ONE", "SIG-ONE"),
   );
-  assert.throws(
-    () => requireClientAccess(repository, "RM-TWO", "CL-0001"),
+  await assert.rejects(
+    async () => await requireClientAccess(repository, "RM-TWO", "CL-0001"),
     ResourceNotFoundError,
   );
-  assert.throws(
-    () => requireSignalAccess(repository, "RM-TWO", "SIG-ONE"),
+  await assert.rejects(
+    async () => await requireSignalAccess(repository, "RM-TWO", "SIG-ONE"),
     ResourceNotFoundError,
   );
-  db.close();
+  await db.end();
 });

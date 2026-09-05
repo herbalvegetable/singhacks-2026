@@ -20,15 +20,15 @@ export async function POST(request: NextRequest) {
   try {
     const session = await requireApiSession();
     assertSameOrigin(request);
-    enforceRateLimit(request, {
+    await enforceRateLimit(request, {
       bucket: "citation-view",
       limit: 120,
       windowMs: 5 * 60_000,
       rmId: session.rmId,
     });
     const input = CitationView.parse(await request.json());
-    requireClientAccess(new Repository(), session.rmId, input.client_id);
-    writeSecurityAuditEvent({
+    await requireClientAccess(new Repository(), session.rmId, input.client_id);
+    await writeSecurityAuditEvent({
       rmId: session.rmId,
       eventType: "citation_viewed",
       target: input.ref_id,

@@ -16,6 +16,86 @@ import {
   stripInternalReferenceTags,
   stripInternalReferenceTagsDeep,
 } from "../../lib/agents/outputSanitizer";
+import type { Repository } from "../../lib/db/repository";
+
+function testRepository(): Repository {
+  return {
+    getClient: async () => ({
+      client_id: "CL-0001",
+      client_name: "Test Client",
+      age: 40,
+      tax_domicile: "Singapore",
+      objectives: "Diversify",
+      life_stage: "Wealth accumulation",
+      risk_profile: "Balanced",
+      risk_tolerance_score: 5,
+      investment_horizon_years: 15,
+      liquidity_needs: "Low",
+      total_aum_usd: 1_000_000,
+      client_since: "2020-01-01",
+    }),
+    getSnapshotDates: async () => ["2026-08-26"],
+    getPortfoliosForClient: async () => [{
+      portfolio_id: "PF-1",
+      client_id: "CL-0001",
+      portfolio_name: "Main",
+      mandate_code: "BAL",
+      mandate_name: "Balanced",
+      service_model: "Advisory",
+    }],
+    getHoldingsForClient: async () => [{
+      snapshot_date: "2026-08-26",
+      portfolio_id: "PF-1",
+      client_id: "CL-0001",
+      instrument_id: "EQ-1",
+      instrument_name: "Example Equity",
+      asset_class: "Equity",
+      sub_asset_class: "Listed Equity",
+      sector: "Technology",
+      region: "Global",
+      instrument_ccy: "USD",
+      quantity: 100,
+      price_local: 6_000,
+      market_value_usd: 600_000,
+      weight_pct: 60,
+      cost_basis_base: 500_000,
+      unrealised_pnl_base: 100_000,
+      unrealised_pnl_pct: 20,
+      liquidity_tier: "T1",
+      advance_rate_pct: 50,
+    }, {
+      snapshot_date: "2026-08-26",
+      portfolio_id: "PF-1",
+      client_id: "CL-0001",
+      instrument_id: "FI-1",
+      instrument_name: "Example Bond",
+      asset_class: "Fixed Income",
+      sub_asset_class: "Investment Grade",
+      sector: "Government",
+      region: "Global",
+      instrument_ccy: "USD",
+      quantity: 100,
+      price_local: 4_000,
+      market_value_usd: 400_000,
+      weight_pct: 40,
+      cost_basis_base: 400_000,
+      unrealised_pnl_base: 0,
+      unrealised_pnl_pct: 0,
+      liquidity_tier: "T1",
+      advance_rate_pct: 70,
+    }],
+    getSignalsForClient: async () => [],
+    getNarrativesForClient: async () => ({}),
+    getDiversificationPlansForClient: async () => [],
+    getClientDataQualityFlags: async () => [],
+    getFacilitiesForClient: async () => [],
+    getCashNeedsForClient: async () => [],
+    getCommitmentsForClient: async () => [],
+    getTransactionsForClient: async () => [],
+    getRmNotesForClient: async () => [],
+    getMandatesForCode: async () => [],
+  } as unknown as Repository;
+}
 
 test("removes internal retrieval tags from generated output", () => {
   assert.equal(
@@ -96,10 +176,11 @@ test("enforces context budget", () => {
   assert.ok(selected.length < records.length);
 });
 
-test("builds an isolated, hashed client context pack", () => {
-  const pack = buildClientContextPack(
+test("builds an isolated, hashed client context pack", async () => {
+  const pack = await buildClientContextPack(
     "CL-0001",
-    "What are the main concentration risks?"
+    "What are the main concentration risks?",
+    testRepository(),
   );
   assert.equal(pack.client_id, "CL-0001");
   assert.match(pack.context_pack_hash, /^[a-f0-9]{64}$/);
@@ -111,10 +192,11 @@ test("builds an isolated, hashed client context pack", () => {
   }
 });
 
-test("builds grounded allocation data and materializes a requested pie chart", () => {
-  const pack = buildClientContextPack(
+test("builds grounded allocation data and materializes a requested pie chart", async () => {
+  const pack = await buildClientContextPack(
     "CL-0001",
     "Show me a pie chart of the portfolio allocation",
+    testRepository(),
   );
   const candidates = buildVisualizationCandidates(pack);
   const allocation = candidates.find(
@@ -156,9 +238,10 @@ test("rejects action execution without calling the model", async () => {
   const { answerClientQuestion } = await import(
     "../../lib/agents/copilot/agent"
   );
-  const pack = buildClientContextPack(
+  const pack = await buildClientContextPack(
     "CL-0001",
-    "Accept and execute this recommendation"
+    "Accept and execute this recommendation",
+    testRepository(),
   );
   const answer = await answerClientQuestion(pack, []);
   assert.equal(answer.refused, true);

@@ -1,6 +1,6 @@
-import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "crypto";
-import { getDb } from "./client";
+import type { QueryResultRow } from "pg";
+import { getDb, withTransaction, type Queryable, type TransactionCapable } from "./client";
 import { Grounding, type Signal } from "../contracts/signal";
 import type { DiversificationPlan } from "../contracts/diversification";
 import type { StoredRiskPriority } from "../contracts/priority";
@@ -11,6 +11,7 @@ import {
 } from "../contracts/decision";
 
 const GENESIS_HASH = "0".repeat(64);
+const AUDIT_CHAIN_LOCK_KEY = 1_447_113_881;
 
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -37,7 +38,7 @@ export function calculateAuditHash(
     .digest("hex");
 }
 
-export interface Client {
+export interface Client extends QueryResultRow {
   client_id: string;
   client_name: string;
   rm_id?: string;
@@ -51,10 +52,10 @@ export interface Client {
   investment_horizon_years: number;
   liquidity_needs: string;
   total_aum_usd: number;
-  // ... other fields
+  client_since: string;
 }
 
-export interface Holding {
+export interface Holding extends QueryResultRow {
   snapshot_date: string;
   portfolio_id: string;
   client_id: string;
@@ -76,7 +77,7 @@ export interface Holding {
   advance_rate_pct: number;
 }
 
-export interface Instrument {
+export interface Instrument extends QueryResultRow {
   instrument_id: string;
   instrument_name: string;
   asset_class: string;
@@ -90,7 +91,7 @@ export interface Instrument {
   sustainability_excluded: string;
 }
 
-export interface Transaction {
+export interface Transaction extends QueryResultRow {
   transaction_id: string;
   trade_date: string;
   portfolio_id: string;
@@ -101,7 +102,7 @@ export interface Transaction {
   narrative: string;
 }
 
-export interface Mandate {
+export interface Mandate extends QueryResultRow {
   mandate_code: string;
   mandate_name: string;
   asset_class: string;
@@ -112,7 +113,7 @@ export interface Mandate {
   mandate_notes: string;
 }
 
-export interface Portfolio {
+export interface Portfolio extends QueryResultRow {
   portfolio_id: string;
   client_id: string;
   portfolio_name: string;
@@ -121,7 +122,7 @@ export interface Portfolio {
   service_model: string;
 }
 
-export interface FacilitySnapshot {
+export interface FacilitySnapshot extends QueryResultRow {
   facility_id: string;
   snapshot_date: string;
   drawn: number;
@@ -131,7 +132,7 @@ export interface FacilitySnapshot {
   headroom: number;
 }
 
-export interface CreditFacility {
+export interface CreditFacility extends QueryResultRow {
   facility_id: string;
   client_id: string;
   collateral_portfolio_id: string;
@@ -139,7 +140,7 @@ export interface CreditFacility {
   facility_ccy: string;
 }
 
-export interface RmNote {
+export interface RmNote extends QueryResultRow {
   note_id: string;
   client_id: string;
   note_date: string;
@@ -147,7 +148,7 @@ export interface RmNote {
   note: string;
 }
 
-export interface CashNeed {
+export interface CashNeed extends QueryResultRow {
   need_id: string;
   client_id: string;
   description: string;
@@ -158,7 +159,7 @@ export interface CashNeed {
   certainty: string;
 }
 
-export interface Commitment {
+export interface Commitment extends QueryResultRow {
   commitment_id: string;
   client_id: string;
   portfolio_id: string;
@@ -168,7 +169,7 @@ export interface Commitment {
   expected_call_window: string;
 }
 
-export interface MarketContext {
+export interface MarketContext extends QueryResultRow {
   snapshot_date: string;
   series_id: string;
   series_name: string;
@@ -178,13 +179,13 @@ export interface MarketContext {
   snapshot_label: string;
 }
 
-export interface InstrumentPrice {
+export interface InstrumentPrice extends QueryResultRow {
   instrument_id: string;
   snapshot_date: string;
   price: number;
 }
 
-export interface MarketEvent {
+export interface MarketEvent extends QueryResultRow {
   event_id: string;
   event_date: string;
   event_type: string;
@@ -195,272 +196,300 @@ export interface MarketEvent {
   transmission_tokens: string;
 }
 
+export interface MorningBriefClient {
+  client_id: string;
+  client_name: string;
+  total_aum_usd: number;
+  signals: Signal[];
+}
+
+export interface PortfolioAllocation extends QueryResultRow {
+  portfolio_id: string;
+  asset_class: string;
+  value_usd: number;
+}
+
+export interface DossierFlag extends QueryResultRow {
+  flag_id: string;
+  severity: "error" | "warning";
+  scope_type: string;
+  scope_id: string;
+  code: string;
+  description: string;
+  source_ref: string;
+}
+
+export interface NarrativeRow {
+  payload: Record<string, unknown>;
+  input_hash: Record<string, string>;
+}
+
+type JsonRow = QueryResultRow & { payload: string };
+type AuditDatabaseRow = QueryResultRow &
+  Omit<AuditEntry, "before" | "after" | "source_refs"> & {
+    before: string;
+    after: string | null;
+    source_refs: string;
+  };
+
+function placeholders(count: number): string {
+  return Array.from({ length: count }, (_, index) => `$${index + 1}`).join(", ");
+}
+
+function parseObject(value: string | null | undefined): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 export class Repository {
-  private db: Database.Database;
+  constructor(
+    private readonly db: TransactionCapable = getDb(),
+    private readonly options: { useAdvisoryLock?: boolean } = {},
+  ) {}
 
-  constructor(database: Database.Database = getDb()) {
-    this.db = database;
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS diversification_plans (
-        plan_id TEXT PRIMARY KEY,
-        signal_id TEXT NOT NULL,
-        client_id TEXT NOT NULL,
-        payload TEXT NOT NULL,
-        input_hash TEXT NOT NULL,
-        generated_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_diversification_signal
-        ON diversification_plans(signal_id, generated_at);
-      CREATE TABLE IF NOT EXISTS groundings (
-        signal_id TEXT PRIMARY KEY,
-        payload TEXT NOT NULL,
-        input_hash TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS priorities (
-        run_id TEXT,
-        rank INTEGER,
-        client_id TEXT,
-        payload TEXT,
-        PRIMARY KEY (run_id, client_id)
-      );
-      CREATE TABLE IF NOT EXISTS audit_log (
-        entry_id TEXT PRIMARY KEY,
-        ts TEXT NOT NULL,
-        rm_id TEXT NOT NULL,
-        action TEXT NOT NULL,
-        target_type TEXT NOT NULL,
-        target_id TEXT NOT NULL,
-        client_id TEXT NOT NULL,
-        before TEXT NOT NULL,
-        after TEXT,
-        reason_code TEXT,
-        reason_text TEXT,
-        confidence_at_decision INTEGER NOT NULL,
-        prompt_version TEXT NOT NULL,
-        model TEXT NOT NULL,
-        input_hash TEXT NOT NULL,
-        context_pack_hash TEXT,
-        source_refs TEXT NOT NULL,
-        prev_hash TEXT NOT NULL,
-        hash TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_audit_target_latest
-        ON audit_log(target_type, target_id, client_id, ts DESC);
-    `);
-  }
-
-  getClient(clientId: string): Client | undefined {
-    return this.db
-      .prepare("SELECT * FROM clients WHERE client_id = ?")
-      .get(clientId) as Client | undefined;
-  }
-
-  getAllClients(): Client[] {
-    return this.db.prepare("SELECT * FROM clients").all() as Client[];
-  }
-
-  getClientsForRm(rmId: string): Client[] {
-    return this.db
-      .prepare("SELECT * FROM clients WHERE rm_id = ? ORDER BY client_name")
-      .all(rmId) as Client[];
-  }
-
-  clientBelongsToRm(clientId: string, rmId: string): boolean {
-    return Boolean(
-      this.db
-        .prepare("SELECT 1 FROM clients WHERE client_id = ? AND rm_id = ?")
-        .get(clientId, rmId),
+  async getClient(clientId: string): Promise<Client | undefined> {
+    const result = await this.db.query<Client>(
+      "SELECT * FROM clients WHERE client_id = $1",
+      [clientId],
     );
+    return result.rows[0];
   }
 
-  signalBelongsToRm(signalId: string, rmId: string): boolean {
-    return Boolean(
-      this.db
-        .prepare(
-          `SELECT 1
-           FROM signals s
-           INNER JOIN clients c ON c.client_id = s.client_id
-           WHERE s.signal_id = ? AND c.rm_id = ?`,
-        )
-        .get(signalId, rmId),
+  async getAllClients(): Promise<Client[]> {
+    return (await this.db.query<Client>("SELECT * FROM clients")).rows;
+  }
+
+  async getClientsForRm(rmId: string): Promise<Client[]> {
+    return (
+      await this.db.query<Client>(
+        "SELECT * FROM clients WHERE rm_id = $1 ORDER BY client_name",
+        [rmId],
+      )
+    ).rows;
+  }
+
+  async clientBelongsToRm(clientId: string, rmId: string): Promise<boolean> {
+    const result = await this.db.query(
+      "SELECT 1 FROM clients WHERE client_id = $1 AND rm_id = $2",
+      [clientId, rmId],
     );
+    return result.rowCount !== 0;
   }
 
-  getHoldingsForClient(clientId: string, snapshotDate: string): Holding[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM holdings 
-         WHERE client_id = ? AND snapshot_date = ?
-         ORDER BY market_value_usd DESC`
+  async signalBelongsToRm(signalId: string, rmId: string): Promise<boolean> {
+    const result = await this.db.query(
+      `SELECT 1
+       FROM signals s
+       INNER JOIN clients c ON c.client_id = s.client_id
+       WHERE s.signal_id = $1 AND c.rm_id = $2`,
+      [signalId, rmId],
+    );
+    return result.rowCount !== 0;
+  }
+
+  async getHoldingsForClient(
+    clientId: string,
+    snapshotDate: string,
+  ): Promise<Holding[]> {
+    return (
+      await this.db.query<Holding>(
+        `SELECT * FROM holdings
+         WHERE client_id = $1 AND snapshot_date = $2
+         ORDER BY market_value_usd DESC`,
+        [clientId, snapshotDate],
       )
-      .all(clientId, snapshotDate) as Holding[];
+    ).rows;
   }
 
-  getHoldingsForPortfolio(
+  async getHoldingsForPortfolio(
     portfolioId: string,
-    snapshotDate: string
-  ): Holding[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM holdings 
-         WHERE portfolio_id = ? AND snapshot_date = ?
-         ORDER BY market_value_usd DESC`
+    snapshotDate: string,
+  ): Promise<Holding[]> {
+    return (
+      await this.db.query<Holding>(
+        `SELECT * FROM holdings
+         WHERE portfolio_id = $1 AND snapshot_date = $2
+         ORDER BY market_value_usd DESC`,
+        [portfolioId, snapshotDate],
       )
-      .all(portfolioId, snapshotDate) as Holding[];
+    ).rows;
   }
 
-  getHoldingHistory(
+  async getHoldingHistory(
     portfolioId: string,
-    instrumentId: string
-  ): Holding[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM holdings 
-         WHERE portfolio_id = ? AND instrument_id = ?
-         ORDER BY snapshot_date`
+    instrumentId: string,
+  ): Promise<Holding[]> {
+    return (
+      await this.db.query<Holding>(
+        `SELECT * FROM holdings
+         WHERE portfolio_id = $1 AND instrument_id = $2
+         ORDER BY snapshot_date`,
+        [portfolioId, instrumentId],
       )
-      .all(portfolioId, instrumentId) as Holding[];
+    ).rows;
   }
 
-  getInstrument(instrumentId: string): Instrument | undefined {
-    return this.db
-      .prepare("SELECT * FROM instruments WHERE instrument_id = ?")
-      .get(instrumentId) as Instrument | undefined;
+  async getInstrument(instrumentId: string): Promise<Instrument | undefined> {
+    return (
+      await this.db.query<Instrument>(
+        "SELECT * FROM instruments WHERE instrument_id = $1",
+        [instrumentId],
+      )
+    ).rows[0];
   }
 
-  getInstruments(instrumentIds: string[]): Instrument[] {
+  async getInstruments(instrumentIds: string[]): Promise<Instrument[]> {
     if (instrumentIds.length === 0) return [];
-    const placeholders = instrumentIds.map(() => "?").join(", ");
-    return this.db
-      .prepare(`SELECT * FROM instruments WHERE instrument_id IN (${placeholders})`)
-      .all(...instrumentIds) as Instrument[];
+    return (
+      await this.db.query<Instrument>(
+        `SELECT * FROM instruments WHERE instrument_id IN (${placeholders(instrumentIds.length)})`,
+        instrumentIds,
+      )
+    ).rows;
   }
 
-  getTransactionsInWindow(
+  async getTransactionsInWindow(
     portfolioId: string,
     from: string,
-    to: string
-  ): Transaction[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM transactions 
-         WHERE portfolio_id = ? 
-         AND trade_date >= ? AND trade_date <= ?
-         ORDER BY trade_date`
+    to: string,
+  ): Promise<Transaction[]> {
+    return (
+      await this.db.query<Transaction>(
+        `SELECT * FROM transactions
+         WHERE portfolio_id = $1 AND trade_date >= $2 AND trade_date <= $3
+         ORDER BY trade_date`,
+        [portfolioId, from, to],
       )
-      .all(portfolioId, from, to) as Transaction[];
+    ).rows;
   }
 
-  getMandatesForCode(mandateCode: string): Mandate[] {
-    return this.db
-      .prepare("SELECT * FROM mandates WHERE mandate_code = ?")
-      .all(mandateCode) as Mandate[];
-  }
-
-  getPortfoliosForClient(clientId: string): Portfolio[] {
-    return this.db
-      .prepare("SELECT * FROM portfolios WHERE client_id = ?")
-      .all(clientId) as Portfolio[];
-  }
-
-  getFacilitySnapshots(facilityId: string): FacilitySnapshot[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM facility_snapshots 
-         WHERE facility_id = ?
-         ORDER BY snapshot_date`
+  async getMandatesForCode(mandateCode: string): Promise<Mandate[]> {
+    return (
+      await this.db.query<Mandate>(
+        "SELECT * FROM mandates WHERE mandate_code = $1",
+        [mandateCode],
       )
-      .all(facilityId) as FacilitySnapshot[];
+    ).rows;
   }
 
-  getFacilitiesForClient(clientId: string): CreditFacility[] {
-    return this.db
-      .prepare("SELECT * FROM credit_facilities WHERE client_id = ?")
-      .all(clientId) as CreditFacility[];
+  async getPortfoliosForClient(clientId: string): Promise<Portfolio[]> {
+    return (
+      await this.db.query<Portfolio>(
+        "SELECT * FROM portfolios WHERE client_id = $1",
+        [clientId],
+      )
+    ).rows;
   }
 
-  getSignalsForClient(clientId: string): Signal[] {
-    const rows = this.db
-      .prepare("SELECT payload FROM signals WHERE client_id = ?")
-      .all(clientId) as { payload: string }[];
+  async getFacilitySnapshots(facilityId: string): Promise<FacilitySnapshot[]> {
+    return (
+      await this.db.query<FacilitySnapshot>(
+        `SELECT * FROM facility_snapshots
+         WHERE facility_id = $1 ORDER BY snapshot_date`,
+        [facilityId],
+      )
+    ).rows;
+  }
+
+  async getFacilitiesForClient(clientId: string): Promise<CreditFacility[]> {
+    return (
+      await this.db.query<CreditFacility>(
+        "SELECT * FROM credit_facilities WHERE client_id = $1",
+        [clientId],
+      )
+    ).rows;
+  }
+
+  async getSignalsForClient(clientId: string): Promise<Signal[]> {
+    const rows = (
+      await this.db.query<JsonRow>(
+        "SELECT payload FROM signals WHERE client_id = $1",
+        [clientId],
+      )
+    ).rows;
     return rows.map((row) => JSON.parse(row.payload) as Signal);
   }
 
-  getSignal(signalId: string): Signal | undefined {
-    const row = this.db
-      .prepare("SELECT payload FROM signals WHERE signal_id = ?")
-      .get(signalId) as { payload: string } | undefined;
+  async getSignal(signalId: string): Promise<Signal | undefined> {
+    const row = (
+      await this.db.query<JsonRow>(
+        "SELECT payload FROM signals WHERE signal_id = $1",
+        [signalId],
+      )
+    ).rows[0];
     return row ? (JSON.parse(row.payload) as Signal) : undefined;
   }
 
-  getNarrativesForClient(clientId: string): Record<string, unknown> {
-    const row = this.db
-      .prepare("SELECT payload FROM narratives WHERE client_id = ?")
-      .get(clientId) as { payload: string } | undefined;
-    return row ? (JSON.parse(row.payload) as Record<string, unknown>) : {};
+  async getNarrativesForClient(
+    clientId: string,
+  ): Promise<Record<string, unknown>> {
+    return (await this.getNarrativeRow(clientId))?.payload ?? {};
   }
 
-  getNarrativeArtifact(
+  async getNarrativeArtifact(
     clientId: string,
     signalId: string,
-  ): { narrative: unknown; input_hash: string } | undefined {
-    const row = this.db
-      .prepare("SELECT payload, input_hash FROM narratives WHERE client_id = ?")
-      .get(clientId) as { payload: string; input_hash: string | null } | undefined;
-    if (!row) return undefined;
-    const narratives = JSON.parse(row.payload) as Record<string, unknown>;
-    if (!(signalId in narratives)) return undefined;
-    let inputHashes: Record<string, string> = {};
-    try {
-      inputHashes = JSON.parse(row.input_hash ?? "{}");
-    } catch {
-      inputHashes = {};
-    }
+  ): Promise<{ narrative: unknown; input_hash: string } | undefined> {
+    const row = await this.getNarrativeRow(clientId);
+    if (!row || !(signalId in row.payload)) return undefined;
     return {
-      narrative: narratives[signalId],
-      input_hash: inputHashes[signalId] ?? "",
+      narrative: row.payload[signalId],
+      input_hash: row.input_hash[signalId] ?? "",
     };
   }
 
-  getRmNotesForClient(clientId: string): RmNote[] {
-    return this.db
-      .prepare(
+  async getRmNotesForClient(clientId: string): Promise<RmNote[]> {
+    return (
+      await this.db.query<RmNote>(
         `SELECT note_id, client_id, note_date, channel, note
-         FROM rm_notes WHERE client_id = ? ORDER BY note_date DESC`
+         FROM rm_notes WHERE client_id = $1 ORDER BY note_date DESC`,
+        [clientId],
       )
-      .all(clientId) as RmNote[];
+    ).rows;
   }
 
-  getTransactionsForClient(clientId: string, limit = 50): Transaction[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM transactions WHERE client_id = ?
-         ORDER BY trade_date DESC LIMIT ?`
+  async getTransactionsForClient(
+    clientId: string,
+    limit = 50,
+  ): Promise<Transaction[]> {
+    return (
+      await this.db.query<Transaction>(
+        `SELECT * FROM transactions WHERE client_id = $1
+         ORDER BY trade_date DESC LIMIT $2`,
+        [clientId, limit],
       )
-      .all(clientId, limit) as Transaction[];
+    ).rows;
   }
 
-  getCashNeedsForClient(clientId: string): CashNeed[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM planned_cash_needs WHERE client_id = ?
-         ORDER BY due_from`
+  async getCashNeedsForClient(clientId: string): Promise<CashNeed[]> {
+    return (
+      await this.db.query<CashNeed>(
+        `SELECT * FROM planned_cash_needs WHERE client_id = $1
+         ORDER BY due_from`,
+        [clientId],
       )
-      .all(clientId) as CashNeed[];
+    ).rows;
   }
 
-  getCommitmentsForClient(clientId: string): Commitment[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM commitments WHERE client_id = ?
-         ORDER BY expected_call_window`
+  async getCommitmentsForClient(clientId: string): Promise<Commitment[]> {
+    return (
+      await this.db.query<Commitment>(
+        `SELECT * FROM commitments WHERE client_id = $1
+         ORDER BY expected_call_window`,
+        [clientId],
       )
-      .all(clientId) as Commitment[];
+    ).rows;
   }
 
-  getClientDataQualityFlags(clientId: string): Record<string, unknown>[] {
-    return this.db
-      .prepare(
+  async getClientDataQualityFlags(
+    clientId: string,
+  ): Promise<Record<string, unknown>[]> {
+    return (
+      await this.db.query<QueryResultRow>(
         `SELECT DISTINCT dq.*
          FROM data_quality_flags dq
          LEFT JOIN portfolios p
@@ -469,106 +498,118 @@ export class Repository {
          LEFT JOIN holdings h
            ON dq.scope_id = h.instrument_id
            OR dq.scope_id LIKE '%:' || h.instrument_id
-         WHERE dq.scope_id = ?
-            OR p.client_id = ?
-            OR h.client_id = ?`
+         WHERE dq.scope_id = $1
+            OR p.client_id = $1
+            OR h.client_id = $1`,
+        [clientId],
       )
-      .all(clientId, clientId, clientId) as Record<string, unknown>[];
+    ).rows;
   }
 
-  getDataQualityFlags(scopeId: string): Record<string, unknown>[] {
-    return this.db
-      .prepare(
-        "SELECT * FROM data_quality_flags WHERE scope_id LIKE ?"
+  async getDataQualityFlags(
+    scopeId: string,
+  ): Promise<Record<string, unknown>[]> {
+    return (
+      await this.db.query<QueryResultRow>(
+        "SELECT * FROM data_quality_flags WHERE scope_id LIKE $1",
+        [`%${scopeId}%`],
       )
-      .all(`%${scopeId}%`) as Record<string, unknown>[];
+    ).rows;
   }
 
-  getSnapshotDates(): string[] {
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT snapshot_date FROM holdings ORDER BY snapshot_date`
-      )
-      .all() as { snapshot_date: string }[];
-    return rows.map((r) => r.snapshot_date);
+  async getSnapshotDates(): Promise<string[]> {
+    const result = await this.db.query<QueryResultRow & { snapshot_date: string }>(
+      "SELECT DISTINCT snapshot_date FROM holdings ORDER BY snapshot_date",
+    );
+    return result.rows.map((row) => row.snapshot_date);
   }
 
-  getMarketContext(snapshotDates?: string[]): MarketContext[] {
+  async getMarketContext(snapshotDates?: string[]): Promise<MarketContext[]> {
     if (!snapshotDates || snapshotDates.length === 0) {
-      return this.db
-        .prepare("SELECT * FROM market_context ORDER BY snapshot_date, series_id")
-        .all() as MarketContext[];
+      return (
+        await this.db.query<MarketContext>(
+          "SELECT * FROM market_context ORDER BY snapshot_date, series_id",
+        )
+      ).rows;
     }
-    const placeholders = snapshotDates.map(() => "?").join(", ");
-    return this.db
-      .prepare(
-        `SELECT * FROM market_context WHERE snapshot_date IN (${placeholders})
+    return (
+      await this.db.query<MarketContext>(
+        `SELECT * FROM market_context
+         WHERE snapshot_date IN (${placeholders(snapshotDates.length)})
          ORDER BY snapshot_date, series_id`,
+        snapshotDates,
       )
-      .all(...snapshotDates) as MarketContext[];
+    ).rows;
   }
 
-  getInstrumentPrices(instrumentIds: string[]): InstrumentPrice[] {
+  async getInstrumentPrices(
+    instrumentIds: string[],
+  ): Promise<InstrumentPrice[]> {
     if (instrumentIds.length === 0) return [];
-    const placeholders = instrumentIds.map(() => "?").join(", ");
-    return this.db
-      .prepare(
-        `SELECT * FROM instrument_prices WHERE instrument_id IN (${placeholders})
+    return (
+      await this.db.query<InstrumentPrice>(
+        `SELECT * FROM instrument_prices
+         WHERE instrument_id IN (${placeholders(instrumentIds.length)})
          ORDER BY instrument_id, snapshot_date`,
+        instrumentIds,
       )
-      .all(...instrumentIds) as InstrumentPrice[];
+    ).rows;
   }
 
-  getEvents(): MarketEvent[] {
-    return this.db
-      .prepare("SELECT * FROM events ORDER BY event_date")
-      .all() as MarketEvent[];
+  async getEvents(): Promise<MarketEvent[]> {
+    return (
+      await this.db.query<MarketEvent>("SELECT * FROM events ORDER BY event_date")
+    ).rows;
   }
 
-  getGrounding(signalId: string, inputHash?: string): Grounding | undefined {
-    const row = inputHash
-      ? (this.db
-          .prepare(
-            `SELECT payload FROM groundings
-             WHERE signal_id = ? AND input_hash = ?`,
-          )
-          .get(signalId, inputHash) as { payload: string } | undefined)
-      : (this.db
-          .prepare("SELECT payload FROM groundings WHERE signal_id = ?")
-          .get(signalId) as { payload: string } | undefined);
+  async getGrounding(
+    signalId: string,
+    inputHash?: string,
+  ): Promise<Grounding | undefined> {
+    const values = inputHash ? [signalId, inputHash] : [signalId];
+    const sql = inputHash
+      ? "SELECT payload FROM groundings WHERE signal_id = $1 AND input_hash = $2"
+      : "SELECT payload FROM groundings WHERE signal_id = $1";
+    const row = (await this.db.query<JsonRow>(sql, values)).rows[0];
     return row ? Grounding.parse(JSON.parse(row.payload)) : undefined;
   }
 
-  getGroundingsForClient(clientId: string): Grounding[] {
-    const rows = this.db
-      .prepare(
+  async getGroundingsForClient(clientId: string): Promise<Grounding[]> {
+    const rows = (
+      await this.db.query<JsonRow>(
         `SELECT g.payload
          FROM groundings g
          INNER JOIN signals s ON s.signal_id = g.signal_id
-         WHERE s.client_id = ?`,
+         WHERE s.client_id = $1`,
+        [clientId],
       )
-      .all(clientId) as Array<{ payload: string }>;
+    ).rows;
     return rows.map((row) => Grounding.parse(JSON.parse(row.payload)));
   }
 
-  saveGrounding(grounding: Grounding, inputHash: string): void {
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO groundings (signal_id, payload, input_hash)
-         VALUES (?, ?, ?)`,
-      )
-      .run(grounding.signal_id, JSON.stringify(grounding), inputHash);
+  async saveGrounding(grounding: Grounding, inputHash: string): Promise<void> {
+    await this.db.query(
+      `INSERT INTO groundings (signal_id, payload, input_hash)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (signal_id) DO UPDATE SET
+         payload = EXCLUDED.payload,
+         input_hash = EXCLUDED.input_hash`,
+      [grounding.signal_id, JSON.stringify(grounding), inputHash],
+    );
   }
 
-  getDiversificationPlansForClient(clientId: string): DiversificationPlan[] {
-    const rows = this.db
-      .prepare(
+  async getDiversificationPlansForClient(
+    clientId: string,
+  ): Promise<DiversificationPlan[]> {
+    const rows = (
+      await this.db.query<QueryResultRow & { signal_id: string; payload: string }>(
         `SELECT signal_id, payload
          FROM diversification_plans
-         WHERE client_id = ?
+         WHERE client_id = $1
          ORDER BY generated_at DESC`,
+        [clientId],
       )
-      .all(clientId) as Array<{ signal_id: string; payload: string }>;
+    ).rows;
     const seenSignals = new Set<string>();
     const plans: DiversificationPlan[] = [];
     for (const row of rows) {
@@ -579,9 +620,9 @@ export class Repository {
     return plans;
   }
 
-  getLatestRiskPriorities(): StoredRiskPriority[] {
-    const rows = this.db
-      .prepare(
+  async getLatestRiskPriorities(): Promise<StoredRiskPriority[]> {
+    const rows = (
+      await this.db.query<JsonRow>(
         `SELECT payload
          FROM priorities
          WHERE run_id = (
@@ -589,86 +630,78 @@ export class Repository {
          )
          ORDER BY rank`,
       )
-      .all() as Array<{ payload: string }>;
-    return rows.map(
-      (row) => JSON.parse(row.payload) as StoredRiskPriority,
-    );
+    ).rows;
+    return rows.map((row) => JSON.parse(row.payload) as StoredRiskPriority);
   }
 
-  getLatestRiskPrioritiesForRm(rmId: string): StoredRiskPriority[] {
-    const rows = this.db
-      .prepare(
+  async getLatestRiskPrioritiesForRm(
+    rmId: string,
+  ): Promise<StoredRiskPriority[]> {
+    const rows = (
+      await this.db.query<JsonRow>(
         `SELECT p.payload
          FROM priorities p
          INNER JOIN clients c ON c.client_id = p.client_id
-         WHERE c.rm_id = ?
+         WHERE c.rm_id = $1
            AND p.run_id = (
              SELECT p2.run_id
              FROM priorities p2
              INNER JOIN clients c2 ON c2.client_id = p2.client_id
-             WHERE c2.rm_id = ?
+             WHERE c2.rm_id = $1
              ORDER BY p2.run_id DESC
              LIMIT 1
            )
          ORDER BY p.rank`,
+        [rmId],
       )
-      .all(rmId, rmId) as Array<{ payload: string }>;
-    return rows.map(
-      (row) => JSON.parse(row.payload) as StoredRiskPriority,
-    );
+    ).rows;
+    return rows.map((row) => JSON.parse(row.payload) as StoredRiskPriority);
   }
 
-  saveRiskPriorities(priorities: StoredRiskPriority[]): void {
+  async saveRiskPriorities(
+    priorities: StoredRiskPriority[],
+  ): Promise<void> {
     if (priorities.length === 0) return;
     const runId = priorities[0].generated_at;
-    const insert = this.db.prepare(
-      `INSERT OR REPLACE INTO priorities
-       (run_id, rank, client_id, payload)
-       VALUES (?, ?, ?, ?)`,
-    );
-    const save = this.db.transaction((items: StoredRiskPriority[]) => {
-      for (const priority of items) {
-        insert.run(
-          runId,
-          priority.rank,
-          priority.client_id,
-          JSON.stringify(priority),
+    await withTransaction(this.db, async (client) => {
+      for (const priority of priorities) {
+        await client.query(
+          `INSERT INTO priorities (run_id, rank, client_id, payload)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (run_id, client_id) DO UPDATE SET
+             rank = EXCLUDED.rank,
+             payload = EXCLUDED.payload`,
+          [runId, priority.rank, priority.client_id, JSON.stringify(priority)],
         );
       }
     });
-    save(priorities);
   }
 
-  getDiversificationPlan(
+  async getDiversificationPlan(
     signalId: string,
     inputHash?: string,
-  ): DiversificationPlan | undefined {
-    const row = inputHash
-      ? (this.db
-          .prepare(
-            `SELECT payload FROM diversification_plans
-             WHERE signal_id = ? AND input_hash = ?
-             ORDER BY generated_at DESC LIMIT 1`,
-          )
-          .get(signalId, inputHash) as { payload: string } | undefined)
-      : (this.db
-          .prepare(
-            `SELECT payload FROM diversification_plans
-             WHERE signal_id = ? ORDER BY generated_at DESC LIMIT 1`,
-          )
-          .get(signalId) as { payload: string } | undefined);
+  ): Promise<DiversificationPlan | undefined> {
+    const values = inputHash ? [signalId, inputHash] : [signalId];
+    const sql = inputHash
+      ? `SELECT payload FROM diversification_plans
+         WHERE signal_id = $1 AND input_hash = $2
+         ORDER BY generated_at DESC LIMIT 1`
+      : `SELECT payload FROM diversification_plans
+         WHERE signal_id = $1 ORDER BY generated_at DESC LIMIT 1`;
+    const row = (await this.db.query<JsonRow>(sql, values)).rows[0];
     return row ? (JSON.parse(row.payload) as DiversificationPlan) : undefined;
   }
 
-  getDiversificationPlanById(
+  async getDiversificationPlanById(
     planId: string,
-  ): { plan: DiversificationPlan; input_hash: string } | undefined {
-    const row = this.db
-      .prepare(
+  ): Promise<{ plan: DiversificationPlan; input_hash: string } | undefined> {
+    const row = (
+      await this.db.query<QueryResultRow & { payload: string; input_hash: string }>(
         `SELECT payload, input_hash FROM diversification_plans
-         WHERE plan_id = ?`,
+         WHERE plan_id = $1`,
+        [planId],
       )
-      .get(planId) as { payload: string; input_hash: string } | undefined;
+    ).rows[0];
     return row
       ? {
           plan: JSON.parse(row.payload) as DiversificationPlan,
@@ -677,33 +710,48 @@ export class Repository {
       : undefined;
   }
 
-  saveDiversificationPlan(plan: DiversificationPlan, inputHash: string): void {
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO diversification_plans
-         (plan_id, signal_id, client_id, payload, input_hash, generated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+  async saveDiversificationPlan(
+    plan: DiversificationPlan,
+    inputHash: string,
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO diversification_plans
+       (plan_id, signal_id, client_id, payload, input_hash, generated_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (plan_id) DO UPDATE SET
+         signal_id = EXCLUDED.signal_id,
+         client_id = EXCLUDED.client_id,
+         payload = EXCLUDED.payload,
+         input_hash = EXCLUDED.input_hash,
+         generated_at = EXCLUDED.generated_at`,
+      [
         plan.plan_id,
         plan.signal_id,
         plan.client_id,
         JSON.stringify(plan),
         inputHash,
         plan.generated_at,
-      );
+      ],
+    );
   }
 
-  appendAuditEntry(input: AppendAuditEntryInput): AuditEntry {
-    const append = this.db.transaction((entryInput: AppendAuditEntryInput) => {
-      const previous = this.db
-        .prepare("SELECT hash FROM audit_log ORDER BY rowid DESC LIMIT 1")
-        .get() as { hash: string | null } | undefined;
+  async appendAuditEntry(input: AppendAuditEntryInput): Promise<AuditEntry> {
+    return withTransaction(this.db, async (client) => {
+      if (this.options.useAdvisoryLock !== false) {
+        await client.query("SELECT pg_advisory_xact_lock($1)", [
+          AUDIT_CHAIN_LOCK_KEY,
+        ]);
+      }
+      const previous = (
+        await client.query<QueryResultRow & { hash: string | null }>(
+          "SELECT hash FROM audit_log ORDER BY chain_seq DESC LIMIT 1",
+        )
+      ).rows[0];
       const prevHash = previous?.hash || GENESIS_HASH;
       const entryWithoutHashes = {
         entry_id: randomUUID(),
         ts: new Date().toISOString(),
-        ...entryInput,
+        ...input,
       };
       const hash = calculateAuditHash(prevHash, entryWithoutHashes);
       const entry = AuditEntry.parse({
@@ -712,56 +760,211 @@ export class Repository {
         hash,
       });
 
-      this.db
-        .prepare(
-          `INSERT INTO audit_log (
-            entry_id, ts, rm_id, action, target_type, target_id, client_id,
-            before, after, reason_code, reason_text, confidence_at_decision,
-            prompt_version, model, input_hash, context_pack_hash, source_refs,
-            prev_hash, hash
-          ) VALUES (
-            @entry_id, @ts, @rm_id, @action, @target_type, @target_id, @client_id,
-            @before, @after, @reason_code, @reason_text, @confidence_at_decision,
-            @prompt_version, @model, @input_hash, @context_pack_hash, @source_refs,
-            @prev_hash, @hash
-          )`,
-        )
-        .run({
-          ...entry,
-          before: canonicalJson(entry.before),
-          after: entry.after === null ? null : canonicalJson(entry.after),
-          source_refs: canonicalJson(entry.source_refs),
-        });
+      await client.query(
+        `INSERT INTO audit_log (
+          entry_id, ts, rm_id, action, target_type, target_id, client_id,
+          before, after, reason_code, reason_text, confidence_at_decision,
+          prompt_version, model, input_hash, context_pack_hash, source_refs,
+          prev_hash, hash
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+          $15, $16, $17, $18, $19
+        )`,
+        [
+          entry.entry_id,
+          entry.ts,
+          entry.rm_id,
+          entry.action,
+          entry.target_type,
+          entry.target_id,
+          entry.client_id,
+          canonicalJson(entry.before),
+          entry.after === null ? null : canonicalJson(entry.after),
+          entry.reason_code,
+          entry.reason_text,
+          entry.confidence_at_decision,
+          entry.prompt_version,
+          entry.model,
+          entry.input_hash,
+          entry.context_pack_hash,
+          canonicalJson(entry.source_refs),
+          entry.prev_hash,
+          entry.hash,
+        ],
+      );
       return entry;
     });
-
-    return append.immediate(input);
   }
 
-  getLatestDecision(
+  async getLatestDecision(
     targetType: DecisionTargetType,
     targetId: string,
     clientId: string,
-  ): AuditEntry | undefined {
-    const row = this.db
-      .prepare(
+  ): Promise<AuditEntry | undefined> {
+    const row = (
+      await this.db.query<AuditDatabaseRow>(
         `SELECT * FROM audit_log
-         WHERE target_type = ? AND target_id = ? AND client_id = ?
-         ORDER BY rowid DESC LIMIT 1`,
+         WHERE target_type = $1 AND target_id = $2 AND client_id = $3
+         ORDER BY chain_seq DESC LIMIT 1`,
+        [targetType, targetId, clientId],
       )
-      .get(targetType, targetId, clientId) as
-      | (Omit<AuditEntry, "before" | "after" | "source_refs"> & {
-          before: string;
-          after: string | null;
-          source_refs: string;
-        })
-      | undefined;
+    ).rows[0];
     if (!row) return undefined;
     return AuditEntry.parse({
       ...row,
       before: JSON.parse(row.before),
       after: row.after === null ? null : JSON.parse(row.after),
       source_refs: JSON.parse(row.source_refs),
+    });
+  }
+
+  async getMorningBriefClients(rmId: string): Promise<MorningBriefClient[]> {
+    const rows = (
+      await this.db.query<
+        QueryResultRow & {
+          client_id: string;
+          client_name: string;
+          total_aum_usd: number;
+          payload: string;
+        }
+      >(
+        `SELECT c.client_id, c.client_name, c.total_aum_usd, s.payload
+         FROM clients c
+         INNER JOIN signals s ON s.client_id = c.client_id
+         WHERE c.rm_id = $1
+         ORDER BY c.client_name, s.signal_id`,
+        [rmId],
+      )
+    ).rows;
+    const clients = new Map<string, MorningBriefClient>();
+    for (const row of rows) {
+      const current = clients.get(row.client_id) ?? {
+        client_id: row.client_id,
+        client_name: row.client_name,
+        total_aum_usd: row.total_aum_usd,
+        signals: [],
+      };
+      current.signals.push(JSON.parse(row.payload) as Signal);
+      clients.set(row.client_id, current);
+    }
+    return [...clients.values()].sort(
+      (left, right) =>
+        right.signals.length - left.signals.length ||
+        left.client_name.localeCompare(right.client_name),
+    );
+  }
+
+  async getClientForRm(
+    clientId: string,
+    rmId: string,
+  ): Promise<Client | undefined> {
+    return (
+      await this.db.query<Client>(
+        "SELECT * FROM clients WHERE client_id = $1 AND rm_id = $2",
+        [clientId, rmId],
+      )
+    ).rows[0];
+  }
+
+  async getLatestHoldingsForClient(clientId: string): Promise<Holding[]> {
+    return (
+      await this.db.query<Holding>(
+        `SELECT * FROM holdings
+         WHERE client_id = $1
+           AND snapshot_date = (
+             SELECT MAX(snapshot_date) FROM holdings WHERE client_id = $1
+           )
+         ORDER BY market_value_usd DESC`,
+        [clientId],
+      )
+    ).rows;
+  }
+
+  async getPortfolioAllocations(
+    clientId: string,
+  ): Promise<PortfolioAllocation[]> {
+    return (
+      await this.db.query<PortfolioAllocation>(
+        `SELECT portfolio_id, asset_class,
+                SUM(market_value_usd) AS value_usd
+         FROM holdings
+         WHERE client_id = $1
+           AND snapshot_date = (
+             SELECT MAX(snapshot_date) FROM holdings WHERE client_id = $1
+           )
+         GROUP BY portfolio_id, asset_class
+         ORDER BY portfolio_id, value_usd DESC`,
+        [clientId],
+      )
+    ).rows;
+  }
+
+  async getDossierFlags(clientId: string): Promise<DossierFlag[]> {
+    return (
+      await this.db.query<DossierFlag>(
+        `SELECT DISTINCT dq.*
+         FROM data_quality_flags dq
+         LEFT JOIN portfolios p
+           ON dq.scope_id = p.portfolio_id
+           OR dq.scope_id LIKE p.portfolio_id || ':%'
+         LEFT JOIN holdings h
+           ON dq.scope_id = h.instrument_id
+           OR dq.scope_id LIKE '%:' || h.instrument_id
+         WHERE dq.scope_id = $1
+            OR p.client_id = $1
+            OR h.client_id = $1`,
+        [clientId],
+      )
+    ).rows;
+  }
+
+  async getNarrativeRow(clientId: string): Promise<NarrativeRow | undefined> {
+    const row = (
+      await this.db.query<
+        QueryResultRow & { payload: string; input_hash: string | null }
+      >(
+        "SELECT payload, input_hash FROM narratives WHERE client_id = $1",
+        [clientId],
+      )
+    ).rows[0];
+    if (!row) return undefined;
+    return {
+      payload: parseObject(row.payload),
+      input_hash: parseObject(row.input_hash) as Record<string, string>,
+    };
+  }
+
+  async saveNarrativeRow(
+    clientId: string,
+    payload: Record<string, unknown>,
+    inputHash: Record<string, string>,
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO narratives (client_id, payload, input_hash)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (client_id) DO UPDATE SET
+         payload = (
+           COALESCE(NULLIF(narratives.payload, ''), '{}')::jsonb
+           || EXCLUDED.payload::jsonb
+         )::text,
+         input_hash = (
+           COALESCE(NULLIF(narratives.input_hash, ''), '{}')::jsonb
+           || EXCLUDED.input_hash::jsonb
+         )::text`,
+      [clientId, JSON.stringify(payload), JSON.stringify(inputHash)],
+    );
+  }
+
+  async replaceSignals(signals: Signal[]): Promise<void> {
+    await withTransaction(this.db, async (client: Queryable) => {
+      await client.query("DELETE FROM signals");
+      for (const signal of signals) {
+        await client.query(
+          `INSERT INTO signals (signal_id, client_id, payload)
+           VALUES ($1, $2, $3)`,
+          [signal.signal_id, signal.client_id, JSON.stringify(signal)],
+        );
+      }
     });
   }
 }

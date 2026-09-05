@@ -178,26 +178,62 @@ export function compactDiversificationPlan(plan: DiversificationPlan) {
   };
 }
 
-export function buildClientContextPack(
+export async function buildClientContextPack(
   clientId: string,
   query: string,
   repository = new Repository()
-): ContextPack {
-  const client = repository.getClient(clientId);
+): Promise<ContextPack> {
+  const [client, dates] = await Promise.all([
+    repository.getClient(clientId),
+    repository.getSnapshotDates(),
+  ]);
   if (!client) throw new Error("Client not found");
 
-  const dates = repository.getSnapshotDates();
   const asOf = dates.at(-1);
   if (!asOf) throw new Error("No holding snapshots available");
 
   const plan = classifyQuery(query);
-  const portfolios = repository.getPortfoliosForClient(clientId);
-  const holdings = repository.getHoldingsForClient(clientId, asOf);
-  const signals = repository.getSignalsForClient(clientId);
-  const narratives = repository.getNarrativesForClient(clientId);
-  const diversificationPlans =
-    repository.getDiversificationPlansForClient(clientId);
-  const flags = repository.getClientDataQualityFlags(clientId);
+  const [
+    portfolios,
+    holdings,
+    signals,
+    narratives,
+    diversificationPlans,
+    flags,
+    facilities,
+    cashNeeds,
+    commitments,
+    transactions,
+    notes,
+  ] = await Promise.all([
+    repository.getPortfoliosForClient(clientId),
+    repository.getHoldingsForClient(clientId, asOf),
+    repository.getSignalsForClient(clientId),
+    repository.getNarrativesForClient(clientId),
+    repository.getDiversificationPlansForClient(clientId),
+    repository.getClientDataQualityFlags(clientId),
+    repository.getFacilitiesForClient(clientId),
+    repository.getCashNeedsForClient(clientId),
+    repository.getCommitmentsForClient(clientId),
+    plan.intents.includes("transaction") || plan.needs_history
+      ? repository.getTransactionsForClient(clientId, 30)
+      : Promise.resolve([]),
+    plan.needs_notes
+      ? repository.getRmNotesForClient(clientId)
+      : Promise.resolve([]),
+  ]);
+  const [mandatesByPortfolio, snapshotsByFacility] = await Promise.all([
+    Promise.all(
+      portfolios.map((portfolio) =>
+        repository.getMandatesForCode(portfolio.mandate_code),
+      ),
+    ),
+    Promise.all(
+      facilities.map((facility) =>
+        repository.getFacilitySnapshots(facility.facility_id),
+      ),
+    ),
+  ]);
   const records: Array<Omit<RetrievedRecord, "score">> = [];
 
   records.push({
@@ -268,8 +304,8 @@ export function buildClientContextPack(
     });
   }
 
-  for (const portfolio of portfolios) {
-    const mandates = repository.getMandatesForCode(portfolio.mandate_code);
+  for (const [index, portfolio] of portfolios.entries()) {
+    const mandates = mandatesByPortfolio[index];
     records.push({
       ref_id: `mandate:${portfolio.portfolio_id}`,
       kind: "mandate",
@@ -303,8 +339,8 @@ export function buildClientContextPack(
     });
   }
 
-  for (const facility of repository.getFacilitiesForClient(clientId)) {
-    const snapshots = repository.getFacilitySnapshots(facility.facility_id);
+  for (const [index, facility] of facilities.entries()) {
+    const snapshots = snapshotsByFacility[index];
     records.push({
       ref_id: `facility:${facility.facility_id}`,
       kind: "facility",
@@ -326,7 +362,7 @@ export function buildClientContextPack(
     });
   }
 
-  for (const need of repository.getCashNeedsForClient(clientId)) {
+  for (const need of cashNeeds) {
     records.push({
       ref_id: `cash_need:${need.need_id}`,
       kind: "cash_need",
@@ -350,7 +386,7 @@ export function buildClientContextPack(
     });
   }
 
-  for (const commitment of repository.getCommitmentsForClient(clientId)) {
+  for (const commitment of commitments) {
     records.push({
       ref_id: `commitment:${commitment.commitment_id}`,
       kind: "commitment",
@@ -373,7 +409,7 @@ export function buildClientContextPack(
   }
 
   if (plan.intents.includes("transaction") || plan.needs_history) {
-    for (const transaction of repository.getTransactionsForClient(clientId, 30)) {
+    for (const transaction of transactions) {
       records.push({
         ref_id: `transaction:${transaction.transaction_id}`,
         kind: "transaction",
@@ -399,7 +435,7 @@ export function buildClientContextPack(
   }
 
   if (plan.needs_notes) {
-    for (const note of repository.getRmNotesForClient(clientId).slice(0, 10)) {
+    for (const note of notes.slice(0, 10)) {
       records.push({
         ref_id: `note:${note.note_id}`,
         kind: "note",

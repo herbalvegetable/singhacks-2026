@@ -21,7 +21,7 @@ const LoginRequest = z.object({
 export async function POST(request: NextRequest) {
   try {
     assertSameOrigin(request);
-    enforceRateLimit(request, {
+    await enforceRateLimit(request, {
       bucket: "login",
       limit: 5,
       windowMs: 15 * 60_000,
@@ -29,7 +29,7 @@ export async function POST(request: NextRequest) {
     const input = LoginRequest.parse(await request.json());
     const identity = authenticateCredentials(input.username, input.password);
     if (!identity) {
-      writeSecurityAuditEvent({
+      await writeSecurityAuditEvent({
         eventType: "authentication_failed",
         target: "login",
       });
@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
       );
     }
     await createSession(identity);
-    writeSecurityAuditEvent({
+    await writeSecurityAuditEvent({
       rmId: identity.rmId,
       eventType: "authentication_succeeded",
       target: "login",

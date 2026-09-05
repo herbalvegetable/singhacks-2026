@@ -33,26 +33,38 @@ export async function POST(
 ) {
   let signalId: string;
   let rmId = "";
-  let releaseConcurrency: (() => void) | undefined;
+  let releaseConcurrency: (() => Promise<void>) | undefined;
+  const releaseLease = async () => {
+    const release = releaseConcurrency;
+    releaseConcurrency = undefined;
+    if (!release) return;
+    try {
+      await release();
+    } catch (error) {
+      console.error("Unable to release diversification concurrency lease:", error);
+    }
+  };
+  let repository: Repository;
   try {
     const session = await requireApiSession();
     rmId = session.rmId;
     assertSameOrigin(request);
-    enforceRateLimit(request, {
+    await enforceRateLimit(request, {
       bucket: "diversification",
       limit: 3,
       windowMs: 10 * 60_000,
       rmId: session.rmId,
     });
-    reserveDailyAiBudget(session.rmId, 16_000);
-    releaseConcurrency = acquireConcurrency(
+    releaseConcurrency = await acquireConcurrency(
       `diversification:${session.rmId}`,
       1,
     );
+    await reserveDailyAiBudget(session.rmId, 16_000);
     signalId = (await context.params).signalId;
-    requireSignalAccess(new Repository(), session.rmId, signalId);
+    repository = new Repository();
+    await requireSignalAccess(repository, session.rmId, signalId);
   } catch (error) {
-    releaseConcurrency?.();
+    await releaseLease();
     const securityResponse = securityErrorResponse(error);
     if (securityResponse) return securityResponse;
     return Response.json({ error: "Resource not found" }, { status: 404 });
@@ -64,8 +76,12 @@ export async function POST(
         controller.enqueue(encoder.encode(event("progress", update)));
       };
       try {
-        const plan = await generateDiversificationPlan(signalId, send);
-        writeSecurityAuditEvent({
+        const plan = await generateDiversificationPlan(
+          signalId,
+          send,
+          repository,
+        );
+        await writeSecurityAuditEvent({
           rmId,
           eventType: "model_response",
           target: "diversification",
@@ -80,19 +96,31 @@ export async function POST(
         controller.enqueue(encoder.encode(event("done", { plan })));
       } catch (error) {
         console.error("Diversification generation error:", error);
-        controller.enqueue(
-          encoder.encode(
-            event("error", {
-              error:
-                "Failed to generate diversification analysis",
-            }),
-          ),
-        );
+        if (!request.signal.aborted) {
+          try {
+            controller.enqueue(
+              encoder.encode(
+                event("error", {
+                  error:
+                    "Failed to generate diversification analysis",
+                }),
+              ),
+            );
+          } catch {
+            // The consumer may already have canceled the stream.
+          }
+        }
       } finally {
-        controller.close();
-        releaseConcurrency?.();
-        releaseConcurrency = undefined;
+        await releaseLease();
+        try {
+          controller.close();
+        } catch {
+          // The consumer may already have canceled the stream.
+        }
       }
+    },
+    async cancel() {
+      await releaseLease();
     },
   });
 

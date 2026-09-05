@@ -18,7 +18,7 @@ export default async function RootLayout({
 }>) {
   const session = await getCurrentSession();
   const clients = (session
-    ? new Repository().getClientsForRm(session.rmId)
+    ? await new Repository().getClientsForRm(session.rmId)
     : [])
     .map(({ client_id, client_name }) => ({ client_id, client_name }));
 

@@ -20,19 +20,33 @@ interface HouseholdExposure {
 export class LookThroughAnalyzer {
   constructor(private repo: Repository) {}
 
-  computeHouseholdExposures(
+  async computeHouseholdExposures(
     clientId: string,
     snapshotDate: string
-  ): HouseholdExposure[] {
-    const holdings = this.repo.getHoldingsForClient(clientId, snapshotDate);
+  ): Promise<HouseholdExposure[]> {
+    const holdings = await this.repo.getHoldingsForClient(clientId, snapshotDate);
     const totalAUM = holdings.reduce((sum, h) => sum + h.market_value_usd, 0);
+    const resolvedInstrumentIds = new Set(holdings.map((holding) => holding.instrument_id));
+    for (const holding of holdings) {
+      const lookThrough = resolveLookThrough(holding.instrument_id);
+      for (const component of lookThrough?.components ?? []) {
+        resolvedInstrumentIds.add(component.instrument_id);
+      }
+    }
+    const instruments = await this.repo.getInstruments([...resolvedInstrumentIds]);
+    const instrumentNames = new Map(
+      instruments.map((instrument) => [
+        instrument.instrument_id,
+        instrument.instrument_name,
+      ]),
+    );
 
     // Map to accumulate exposures
     const exposureMap = new Map<string, HouseholdExposure>();
 
     for (const holding of holdings) {
       // Direct exposure
-      this.addExposure(exposureMap, clientId, holding, totalAUM, {
+      this.addExposure(exposureMap, instrumentNames, clientId, holding, totalAUM, {
         portfolio_id: holding.portfolio_id,
         instrument_id: holding.instrument_id,
         direct: true,
@@ -45,7 +59,7 @@ export class LookThroughAnalyzer {
       if (lookThrough && lookThrough.components.length > 0) {
         for (const component of lookThrough.components) {
           const componentValue = holding.market_value_usd * component.weight;
-          this.addExposure(exposureMap, clientId, holding, totalAUM, {
+          this.addExposure(exposureMap, instrumentNames, clientId, holding, totalAUM, {
             portfolio_id: holding.portfolio_id,
             instrument_id: component.instrument_id,
             direct: false,
@@ -63,6 +77,7 @@ export class LookThroughAnalyzer {
 
   private addExposure(
     map: Map<string, HouseholdExposure>,
+    instrumentNames: Map<string, string>,
     clientId: string,
     holding: Holding,
     totalAUM: number,
@@ -76,11 +91,11 @@ export class LookThroughAnalyzer {
       existing.total_weight_pct = (existing.total_market_value_usd / totalAUM) * 100;
       existing.components.push(component);
     } else {
-      const inst = this.repo.getInstrument(component.instrument_id);
       map.set(key, {
         client_id: clientId,
         resolved_instrument_id: component.instrument_id,
-        resolved_instrument_name: inst?.instrument_name || component.instrument_id,
+        resolved_instrument_name:
+          instrumentNames.get(component.instrument_id) || component.instrument_id,
         total_market_value_usd: component.market_value_usd,
         total_weight_pct: (component.market_value_usd / totalAUM) * 100,
         components: [component],

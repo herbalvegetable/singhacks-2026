@@ -65,18 +65,21 @@ export interface ResolvedDecisionTarget {
   source_refs: SourceRef[];
 }
 
-export function resolveDecisionTarget(
+export async function resolveDecisionTarget(
   repository: Repository,
   targetType: DecisionTargetType,
   targetId: string,
   claimedClientId: string,
-): ResolvedDecisionTarget {
+): Promise<ResolvedDecisionTarget> {
   if (targetType === "narrative_recommendation") {
-    const signal = repository.getSignal(targetId);
+    const signal = await repository.getSignal(targetId);
     if (!signal) throw new DecisionTargetError("Signal not found", 404);
     assertOwner(signal.client_id, claimedClientId);
 
-    const stored = repository.getNarrativeArtifact(signal.client_id, targetId);
+    const [stored, grounding] = await Promise.all([
+      repository.getNarrativeArtifact(signal.client_id, targetId),
+      repository.getGrounding(targetId),
+    ]);
     if (!stored) throw new DecisionTargetError("Narrative not found", 404);
     const narrative = NarrativeArtifact.parse(stored.narrative);
     if (!narrative.recommended_action) {
@@ -85,7 +88,6 @@ export function resolveDecisionTarget(
         400,
       );
     }
-    const grounding = repository.getGrounding(targetId);
     return {
       target_type: targetType,
       target_id: targetId,
@@ -114,7 +116,7 @@ export function resolveDecisionTarget(
   }
   const planId = targetId.slice(0, separator);
   const actionId = targetId.slice(separator + 1);
-  const stored = repository.getDiversificationPlanById(planId);
+  const stored = await repository.getDiversificationPlanById(planId);
   if (!stored) throw new DecisionTargetError("Diversification plan not found", 404);
   assertOwner(stored.plan.client_id, claimedClientId);
   const action = stored.plan.actions.find(

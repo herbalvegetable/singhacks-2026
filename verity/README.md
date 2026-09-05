@@ -18,7 +18,7 @@ Verity is a grounded wealth-intelligence workbench for that gap. It combines det
 6. answer client-scoped questions through a read-only, citation-backed Copilot; and
 7. keep the RM in control through explicit Accept, Modify, or Reject decisions and tamper-evident audit chains.
 
-The current dataset contains **20 clients, 1,015 holding rows, 16 market events, 36 generated signals, and 4 detected data-quality flags**. These counts are checked by `npm run verify`.
+The current dataset contains **20 clients, 1,015 holding rows, 16 market events, 36 generated signals, and 5 detected data-quality flags**. These counts are checked by `npm run verify`.
 
 ## The challenge
 
@@ -72,12 +72,13 @@ The following is the complete journey from raw data to an RM-controlled client c
 
 Before Priscilla starts her day, Verity prepares a structured view of the book:
 
-1. `npm run ingest` loads the 12 supplied CSV/JSON sources into SQLite.
-2. Wide time-series columns are normalized into dated price, AUM, facility, and FX tables.
-3. ingestion identifies missing cost basis, pre-relationship snapshots, lagged marks, and other data-quality conditions.
-4. `npm run pipeline` compares the earliest and latest available snapshots, creates deterministic signals, and pre-filters possible market-event explanations.
-5. If agents are enabled, the event-grounding agent assesses candidate events. Existing input hashes allow matching grounded results to be reused.
-6. Book priorities can be generated through the protected priorities API and are reused while their input hash is unchanged.
+1. `npm run migrate` applies the committed PostgreSQL schema to Neon.
+2. `npm run ingest` loads the 12 supplied CSV/JSON sources into Neon Postgres.
+3. Wide time-series columns are normalized into dated price, AUM, facility, and FX tables.
+4. Ingestion identifies missing cost basis, pre-relationship snapshots, lagged marks, and other data-quality conditions.
+5. `npm run pipeline` compares the earliest and latest available snapshots, creates deterministic signals, and pre-filters possible market-event explanations.
+6. If agents are enabled, the event-grounding agent assesses candidate events. Existing input hashes allow matching grounded results to be reused.
+7. Book priorities can be generated through the protected priorities API and are reused while their input hash is unchanged.
 
 No LLM calculates P&L, exposure, concentration, allocation, mandate compliance, scenario paths, VaR, CVaR, or drawdown.
 
@@ -101,11 +102,11 @@ The authenticated home page is the RM's book-level command centre.
 2. Each client card shows AUM, signal count, the two leading signals, source lineage, and the latest model-assisted risk-priority badge.
 3. Clients are sorted first by book-calibrated risk score and then by deterministic signal urgency.
 4. Priority generation assesses five visible dimensions:
-   - signal severity;
-   - liquidity deadlines;
-   - concentration;
-   - credit/margin risk; and
-   - data uncertainty.
+  - signal severity;
+  - liquidity deadlines;
+  - concentration;
+  - credit/margin risk; and
+  - data uncertainty.
 5. The result assigns an attention band: **Call today**, **This week**, or **Monitor**.
 
 The score is an ordering aid, not an automated decision. Its summary, rationale, uncertainty, and evidence references remain inspectable.
@@ -152,11 +153,11 @@ The RM selects **Generate Analysis** on a signal.
 3. A matching cached narrative is returned when available.
 4. Otherwise, the Narrative Agent receives verified signal values and selected client context.
 5. `gpt-4o` returns schema-validated structured output:
-   - a three-part story covering what happened, why it matters, and what to consider;
-   - a suggested opening line for the client conversation;
-   - a conservative discussion-oriented action with steps, rationale, and confidence;
-   - caveats; and
-   - overall confidence.
+  - a three-part story covering what happened, why it matters, and what to consider;
+  - a suggested opening line for the client conversation;
+  - a conservative discussion-oriented action with steps, rationale, and confidence;
+  - caveats; and
+  - overall confidence.
 6. A deterministic suitability layer labels free-form actions as discussion-only, no-change, or requiring quantified analysis.
 7. Internal reference tags are removed, the response is cached, and a model-use security event is recorded.
 
@@ -167,36 +168,36 @@ The Narrative Agent is forbidden to perform arithmetic, invent allocation percen
 If the narrative suggests that portfolio change deserves analysis, the RM selects **Explore Diversification**. The UI streams progress as Verity completes a multi-stage workflow:
 
 1. **Evidence retrieval**
-   - retrieves the signal, client objectives, current holdings, portfolio mandates, cash needs, liquidity tiers, and data-quality flags;
-   - builds a normalized portfolio envelope and a hash of the context pack.
+  - retrieves the signal, client objectives, current holdings, portfolio mandates, cash needs, liquidity tiers, and data-quality flags;
+  - builds a normalized portfolio envelope and a hash of the context pack.
 2. **Constraint construction**
-   - establishes the baseline value;
-   - reserves required cash;
-   - records mandate ranges, single-position limits, liquidity constraints, and suitability inputs.
+  - establishes the baseline value;
+  - reserves required cash;
+  - records mandate ranges, single-position limits, liquidity constraints, and suitability inputs.
 3. **Action generation**
-   - asks a narrowly scoped agent for three objectives-aligned approaches;
-   - uses deterministic action templates if model generation is unavailable.
+  - asks a narrowly scoped agent for three objectives-aligned approaches;
+  - uses deterministic action templates if model generation is unavailable.
 4. **Deterministic validation and repair**
-   - makes every trade fully funded;
-   - clips or repairs proposals that breach constraints;
-   - checks resulting portfolio allocations against each managed portfolio's mandate;
-   - excludes custody portfolios from managed-mandate claims;
-   - returns a constraint-aware “hold/review” result if no safe funded trade pair exists.
+  - makes every trade fully funded;
+  - clips or repairs proposals that breach constraints;
+  - checks resulting portfolio allocations against each managed portfolio's mandate;
+  - excludes custody portfolios from managed-mandate claims;
+  - returns a constraint-aware “hold/review” result if no safe funded trade pair exists.
 5. **Reproducible scenario simulation**
-   - runs seeded 36-month Monte Carlo paths;
-   - uses common random market paths so hold-current and proposed actions are comparable;
-   - evaluates four scenarios: Central, Hormuz Re-escalation, De-escalation, and Rate Shock Persistence;
-   - computes P10/P50/P90 terminal values, expected and annualized return, volatility, Sharpe ratio, 95% VaR, 95% CVaR, probability of loss, and median-path maximum drawdown.
+  - runs seeded 36-month Monte Carlo paths;
+  - uses common random market paths so hold-current and proposed actions are comparable;
+  - evaluates four scenarios: Central, Hormuz Re-escalation, De-escalation, and Rate Shock Persistence;
+  - computes P10/P50/P90 terminal values, expected and annualized return, volatility, Sharpe ratio, 95% VaR, 95% CVaR, probability of loss, and median-path maximum drawdown.
 6. **Risk and suitability scoring**
-   - evaluates concentration, liquidity, mandate checks, client risk tolerance, and profile;
-   - states whether the action is mandate-compliant and tolerance-aligned.
+  - evaluates concentration, liquidity, mandate checks, client risk tolerance, and profile;
+  - states whether the action is mandate-compliant and tolerance-aligned.
 7. **Summary generation**
-   - asks a separate summary agent to explain only the already-computed result;
-   - applies a confidence ceiling based on source quality and prior narrative confidence;
-   - falls back to a deterministic summary if the model is unavailable.
+  - asks a separate summary agent to explain only the already-computed result;
+  - applies a confidence ceiling based on source quality and prior narrative confidence;
+  - falls back to a deterministic summary if the model is unavailable.
 8. **Presentation and caching**
-   - displays three selectable actions, concrete trades or safe fallback, scenario chart, trade-offs, talking points, methodology, assumptions, caveats, and evidence;
-   - caches the plan by context, assumption-set, and suitability-version hash.
+  - displays three selectable actions, concrete trades or safe fallback, scenario chart, trade-offs, talking points, methodology, assumptions, caveats, and evidence;
+  - caches the plan by context, assumption-set, and suitability-version hash.
 
 These are **assumption-driven illustrations, not forecasts or executable orders**. The UI says so explicitly and exposes the capital-market assumptions.
 
@@ -340,7 +341,7 @@ The system supports the full 20-client book, while these three cases demonstrate
 ```mermaid
 flowchart LR
     A[12 CSV/JSON source files] --> B[Deterministic ingestion]
-    B --> C[(SQLite / verity.db)]
+    B --> C[(Neon Postgres)]
     C --> D[Snapshot attribution]
     C --> E[Look-through concentration]
     D --> F[Structured signals]
@@ -365,6 +366,8 @@ flowchart LR
     K --> Q[Accept / Modify / Reject]
     Q --> R[(Hash-chained decision audit)]
 ```
+
+
 
 ### Architectural principles
 
@@ -393,7 +396,7 @@ Input files in `data/`:
 - `event_log.csv` — bounded event evidence used for causal grounding
 - `rm_notes.json` — relationship context treated as untrusted text
 
-SQLite stores normalized source data plus:
+Neon Postgres stores normalized source data plus:
 
 - `signals`
 - `groundings`
@@ -408,7 +411,7 @@ SQLite stores normalized source data plus:
 - `request_rate_limits`
 - `ai_budget_usage`
 
-SQLite runs in WAL mode with foreign keys and secure deletion enabled. Production startup requires an explicit database path and encryption-at-rest acknowledgement.
+Runtime traffic uses Neon's pooled `DATABASE_URL` through a small `pg` pool managed for Vercel Fluid Compute. Migrations and trusted seed operations prefer `DATABASE_URL_UNPOOLED`. Schema creation is explicit and versioned rather than occurring during requests.
 
 ### API surface
 
@@ -452,9 +455,9 @@ No-match grounding, unsupported Copilot questions, untraceable numbers, prompt i
 
 The auditable unit is not merely a generated paragraph. It is the generated artifact, its exact provenance and evidence, the confidence shown at review time, and the RM's recorded response.
 
-## Alignment with the judging rubric
+## Important Pointers
 
-### Client-Centric Innovation — 25%
+### Client-Centric Innovation
 
 - Connects portfolio facts to life stage, retirement income, objectives, liquidity needs, tax domicile, and known client context.
 - Produces an RM opening line and talking points, not just metrics.
@@ -462,7 +465,7 @@ The auditable unit is not merely a generated paragraph. It is the generated arti
 - Finds hidden household and look-through risks that a conventional account dashboard misses.
 - Keeps recommendations conservative and distinguishes discussion from quantified suitability.
 
-### User Experience & Design — 25%
+### User Experience & Design
 
 - Starts with a ranked Morning Brief built around the RM's real “who do I call first?” task.
 - Uses progressive disclosure: queue → dossier → signal → evidence → narrative → scenario comparison → decision.
@@ -471,7 +474,7 @@ The auditable unit is not merely a generated paragraph. It is the generated arti
 - Uses deterministic client-specific opening questions and generated follow-ups to reduce blank-page friction.
 - Presents Accept/Modify/Reject where the recommendation is reviewed, while clearly stating that acceptance does not execute.
 
-### Technical & Operational Feasibility — 25%
+### Technical & Operational Feasibility
 
 - Keeps arithmetic, risk metrics, constraint checks, and simulations in testable TypeScript.
 - Uses schema-validated model output and bounded candidate/context sets.
@@ -481,7 +484,7 @@ The auditable unit is not merely a generated paragraph. It is the generated arti
 - Maintains decision and security audit chains.
 - Includes 33 passing automated tests across Copilot, decisions, diversification, grounding, prioritization, authorization, policies, and route boundaries.
 
-### Strategic Impact — 25%
+### Strategic Impact
 
 - Compresses hours of manual book reconciliation into a prioritized, meeting-ready workflow.
 - Helps RMs hold more timely, personal, evidence-backed conversations.
@@ -500,7 +503,7 @@ The auditable unit is not merely a generated paragraph. It is the generated arti
 
 **Data and analytics**
 
-- SQLite through `better-sqlite3`
+- Neon Postgres through `pg`
 - `csv-parse`
 - deterministic TypeScript compute modules
 - seeded Monte Carlo simulation and constraint repair
@@ -542,7 +545,7 @@ Implemented pilot controls include:
 - input/context hashes and prompt versions;
 - hash-linked decision and security audit events;
 - production HSTS and other response headers; and
-- production database encryption-at-rest acknowledgement.
+- managed Neon encryption, TLS connections, and isolated preview branches.
 
 See `SECURITY.md` for operational controls and production boundaries.
 
@@ -563,7 +566,11 @@ npm install
 
 ### 2. Configure `.env.local`
 
-Create `verity/.env.local` with the following values:
+Copy `.env.example` to `.env.local`, then configure the values:
+
+```powershell
+Copy-Item .env.example .env.local
+```
 
 ```dotenv
 OPENAI_API_KEY=your-key
@@ -584,18 +591,19 @@ Generate the password hash without saving a plaintext password:
 npm run hash-password -- "your-pilot-password"
 ```
 
-Optional deployment variables:
+Database variables are injected automatically when Neon is connected through Vercel Marketplace:
 
 ```dotenv
-VERITY_DB_PATH=/secure/managed-volume/verity.db
-VERITY_DB_ENCRYPTION_AT_REST_ACKNOWLEDGED=true
+DATABASE_URL=postgresql://pooled-runtime-connection
+DATABASE_URL_UNPOOLED=postgresql://direct-migration-connection
 ```
 
-Do not commit `.env.local` or `verity.db`. Use an approved secret manager and enterprise model endpoint before processing non-synthetic client data.
+Do not commit `.env.local` or database credentials. Use an approved secret manager and enterprise model endpoint before processing non-synthetic client data.
 
-### 3. Ingest and compute
+### 3. Migrate, ingest, and compute
 
 ```powershell
+npm run migrate
 npm run ingest
 npm run pipeline
 npm run verify
@@ -608,7 +616,7 @@ Clients: 20
 Holdings: 1015
 Events: 16
 Signals: 36
-Data-quality flags: 4
+Data-quality flags: 5
 ```
 
 If `VERITY_AGENTS_ENABLED` and `OPENAI_API_KEY` are configured, the pipeline also runs event grounding for candidate-bearing signals. Without them, deterministic signals still work and no-match records can still be created where there are no candidates.
@@ -620,6 +628,37 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) and sign in with the configured pilot credentials.
+
+## Deploy to Vercel with Neon
+
+1. Push the repository to GitHub and import it into Vercel.
+2. Set the Vercel project's root directory to `verity`.
+3. From the project dashboard, open **Storage/Marketplace**, provision Neon Postgres in the nearest suitable region, and connect it to Production and Preview environments.
+4. Enable Neon preview branching so each preview deployment receives an isolated copy-on-write branch.
+5. Pull the development credentials locally:
+
+```powershell
+npx vercel link
+npx vercel env pull .env.local
+```
+
+6. Add the existing OpenAI and `VERITY_*` variables from `.env.example` in Vercel. Neon supplies `DATABASE_URL` and `DATABASE_URL_UNPOOLED`.
+7. Apply the schema and seed the synthetic demo once against the intended Neon branch:
+
+```powershell
+npm run migrate
+npm run seed
+npm run pipeline
+npm run verify
+```
+
+8. Deploy from the Vercel dashboard or CLI:
+
+```powershell
+npx vercel --prod
+```
+
+Do not run ingestion automatically on every production build: it resets source-derived tables and is intended as a controlled demo-data operation. Runtime requests use the pooled connection; migration and seed scripts prefer the unpooled connection.
 
 ## Verification and tests
 
@@ -668,12 +707,15 @@ verity/
 │   ├── agents/                   # Bounded model workflows and guards
 │   ├── compute/                  # Deterministic analytics and simulation
 │   ├── contracts/                # Zod schemas
-│   ├── db/                       # SQLite connection and repository
+│   ├── db/                       # Neon Postgres pool and async repository
 │   ├── decisions/                # Decision target resolution
 │   └── security/                 # Auth, access, abuse, audit, conversation
+├── migrations/
+│   └── 001_initial.sql           # Consolidated PostgreSQL schema
 ├── scripts/
 │   ├── hashPassword.ts
 │   ├── ingest.ts
+│   ├── migrate.ts
 │   ├── pipeline.ts
 │   └── verify.ts
 └── tests/
@@ -685,7 +727,7 @@ Verity is a functional hackathon pilot, not a production banking system.
 
 - Data is synthetic and local.
 - Pilot credentials must be replaced with enterprise OIDC/SSO.
-- SQLite should be replaced or operated on an encrypted, access-controlled managed volume with backup and deletion policies.
+- Neon must be configured with the required region, access controls, backup, retention, and deletion policies before non-synthetic use.
 - In-memory rate and concurrency controls should move to shared infrastructure for multi-instance deployment.
 - `gpt-4o` access must use approved residency, contractual, and zero-retention terms.
 - Scenario assumptions are illustrative and use limited source history; they are disclosed rather than presented as forecasts.

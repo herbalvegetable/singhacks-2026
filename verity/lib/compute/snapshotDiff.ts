@@ -19,14 +19,16 @@ interface PositionChange {
 export class SnapshotDiffer {
   constructor(private repo: Repository) {}
 
-  computePositionChanges(
+  async computePositionChanges(
     portfolioId: string,
     fromDate: string,
     toDate: string
-  ): PositionChange[] {
-    const fromHoldings = this.repo.getHoldingsForPortfolio(portfolioId, fromDate);
-    const toHoldings = this.repo.getHoldingsForPortfolio(portfolioId, toDate);
-    const transactions = this.repo.getTransactionsInWindow(portfolioId, fromDate, toDate);
+  ): Promise<PositionChange[]> {
+    const [fromHoldings, toHoldings, transactions] = await Promise.all([
+      this.repo.getHoldingsForPortfolio(portfolioId, fromDate),
+      this.repo.getHoldingsForPortfolio(portfolioId, toDate),
+      this.repo.getTransactionsInWindow(portfolioId, fromDate, toDate),
+    ]);
 
     const changes: PositionChange[] = [];
     const toMap = new Map(toHoldings.map((h) => [h.instrument_id, h]));

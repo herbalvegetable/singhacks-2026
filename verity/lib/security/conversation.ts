@@ -1,7 +1,7 @@
 import "server-only";
 
 import { randomUUID } from "crypto";
-import { getDb } from "../db/client";
+import { getDb, withTransaction } from "../db/client";
 import { ResourceNotFoundError } from "./access";
 
 type ChatRole = "user" | "assistant";
@@ -11,98 +11,78 @@ export interface ConversationHistoryItem {
   content: string;
 }
 
-function ensureTables(): void {
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS chat_conversations (
-      conversation_id TEXT PRIMARY KEY,
-      rm_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS chat_messages (
-      message_id TEXT PRIMARY KEY,
-      conversation_id TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-      content TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (conversation_id) REFERENCES chat_conversations(conversation_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
-      ON chat_messages(conversation_id, created_at);
-  `);
-}
-
-export function openConversation(input: {
+export async function openConversation(input: {
   conversationId?: string;
   rmId: string;
   clientId: string;
-}): { conversationId: string; history: ConversationHistoryItem[] } {
-  ensureTables();
+}): Promise<{
+  conversationId: string;
+  history: ConversationHistoryItem[];
+}> {
   const conversationId = input.conversationId ?? randomUUID();
   const now = new Date().toISOString();
-  if (input.conversationId) {
-    const owner = getDb()
-      .prepare(
+  return withTransaction(getDb(), async (client) => {
+    if (input.conversationId) {
+      const owner = await client.query(
         `SELECT 1 FROM chat_conversations
-         WHERE conversation_id = ? AND rm_id = ? AND client_id = ?`,
-      )
-      .get(conversationId, input.rmId, input.clientId);
-    if (!owner) throw new ResourceNotFoundError();
-  } else {
-    getDb()
-      .prepare(
+         WHERE conversation_id = $1 AND rm_id = $2 AND client_id = $3
+         FOR SHARE`,
+        [conversationId, input.rmId, input.clientId],
+      );
+      if (owner.rowCount === 0) throw new ResourceNotFoundError();
+    } else {
+      await client.query(
         `INSERT INTO chat_conversations
          (conversation_id, rm_id, client_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(conversationId, input.rmId, input.clientId, now, now);
-  }
-  const rows = getDb()
-    .prepare(
+         VALUES ($1, $2, $3, $4, $5)`,
+        [conversationId, input.rmId, input.clientId, now, now],
+      );
+    }
+    const rows = (
+      await client.query<ConversationHistoryItem>(
       `SELECT role, content FROM (
          SELECT role, content, created_at
          FROM chat_messages
-         WHERE conversation_id = ?
+         WHERE conversation_id = $1
          ORDER BY created_at DESC
          LIMIT 12
-       ) ORDER BY created_at`,
-    )
-    .all(conversationId) as ConversationHistoryItem[];
-  return { conversationId, history: rows };
+       ) recent_messages
+       ORDER BY created_at`,
+        [conversationId],
+      )
+    ).rows;
+    return { conversationId, history: rows };
+  });
 }
 
-export function appendConversationExchange(input: {
+export async function appendConversationExchange(input: {
   conversationId: string;
   query: string;
   answer: string;
-}): void {
-  ensureTables();
-  const db = getDb();
+}): Promise<void> {
   const now = Date.now();
-  const insert = db.prepare(
-    `INSERT INTO chat_messages
-     (message_id, conversation_id, role, content, created_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  );
-  const append = db.transaction(() => {
-    insert.run(
-      randomUUID(),
-      input.conversationId,
-      "user",
-      input.query,
-      new Date(now).toISOString(),
+  await withTransaction(getDb(), async (client) => {
+    await client.query(
+      `INSERT INTO chat_messages
+       (message_id, conversation_id, role, content, created_at)
+       VALUES
+         ($1, $2, 'user', $3, $4),
+         ($5, $2, 'assistant', $6, $7)`,
+      [
+        randomUUID(),
+        input.conversationId,
+        input.query,
+        new Date(now).toISOString(),
+        randomUUID(),
+        input.answer,
+        new Date(now + 1).toISOString(),
+      ],
     );
-    insert.run(
-      randomUUID(),
-      input.conversationId,
-      "assistant",
-      input.answer,
-      new Date(now + 1).toISOString(),
+    await client.query(
+      `UPDATE chat_conversations
+       SET updated_at = $1
+       WHERE conversation_id = $2`,
+      [new Date(now + 1).toISOString(), input.conversationId],
     );
-    db.prepare(
-      "UPDATE chat_conversations SET updated_at = ? WHERE conversation_id = ?",
-    ).run(new Date(now + 1).toISOString(), input.conversationId);
   });
-  append.immediate();
 }

@@ -1,12 +1,16 @@
 import { parse } from "csv-parse/sync";
 import fs from "fs";
 import path from "path";
-import { getDb, closeDb } from "../lib/db/client";
-import type Database from "better-sqlite3";
+import { loadEnvConfig } from "@next/env";
+import {
+  createAdminDb,
+  withTransaction,
+  type Queryable,
+} from "../lib/db/client";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 
-type CountRow = { count: number };
+type CountRow = { count: string };
 type MissingCostRow = {
   snapshot_date: string;
   portfolio_id: string;
@@ -21,6 +25,8 @@ type PreRelationshipRow = {
   client_since: string;
 };
 type DataRow = Record<string, string | number | null>;
+
+loadEnvConfig(process.cwd());
 
 function loadCSV(filename: string): DataRow[] {
   const content = fs.readFileSync(path.join(DATA_DIR, filename), "utf-8");
@@ -37,298 +43,66 @@ function loadJSON(filename: string): DataRow[] {
   return JSON.parse(content) as DataRow[];
 }
 
-function createTables(db: Database.Database) {
-  db.exec(`
-    -- Core tables
-    CREATE TABLE IF NOT EXISTS clients (
-      client_id TEXT PRIMARY KEY,
-      client_name TEXT,
-      age INTEGER,
-      gender TEXT,
-      nationality TEXT,
-      country_of_residence TEXT,
-      tax_domicile TEXT,
-      booking_centre TEXT,
-      rm_id TEXT,
-      rm_name TEXT,
-      rm_desk TEXT,
-      base_currency TEXT,
-      wealth_band TEXT,
-      total_aum_usd REAL,
-      life_stage TEXT,
-      source_of_wealth TEXT,
-      risk_profile TEXT,
-      risk_tolerance_score INTEGER,
-      investment_horizon_years INTEGER,
-      liquidity_needs TEXT,
-      objectives TEXT,
-      client_since TEXT,
-      kyc_review_due TEXT,
-      pep_status TEXT,
-      reporting_language TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS portfolios (
-      portfolio_id TEXT PRIMARY KEY,
-      client_id TEXT,
-      portfolio_name TEXT,
-      mandate_code TEXT,
-      mandate_name TEXT,
-      service_model TEXT,
-      base_currency TEXT,
-      inception_date TEXT,
-      benchmark TEXT,
-      aum_usd_current REAL,
-      FOREIGN KEY (client_id) REFERENCES clients(client_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS holdings (
-      snapshot_date TEXT,
-      portfolio_id TEXT,
-      client_id TEXT,
-      instrument_id TEXT,
-      instrument_name TEXT,
-      asset_class TEXT,
-      sub_asset_class TEXT,
-      sector TEXT,
-      region TEXT,
-      instrument_ccy TEXT,
-      quantity REAL,
-      price_local REAL,
-      market_value_local REAL,
-      portfolio_ccy TEXT,
-      market_value_base REAL,
-      market_value_usd REAL,
-      weight_pct REAL,
-      avg_cost_local REAL,
-      cost_basis_base REAL,
-      unrealised_pnl_base REAL,
-      unrealised_pnl_pct REAL,
-      lending_value_base REAL,
-      advance_rate_pct REAL,
-      liquidity_tier TEXT,
-      valuation_date TEXT,
-      acquired_date TEXT,
-      PRIMARY KEY (snapshot_date, portfolio_id, instrument_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS instruments (
-      instrument_id TEXT PRIMARY KEY,
-      instrument_name TEXT,
-      asset_class TEXT,
-      sub_asset_class TEXT,
-      sector TEXT,
-      region TEXT,
-      currency TEXT,
-      liquidity_tier TEXT,
-      underlying_reference TEXT,
-      sustainability_excluded TEXT,
-      concentration_limit_applies TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS mandates (
-      mandate_code TEXT,
-      mandate_name TEXT,
-      asset_class TEXT,
-      min_pct REAL,
-      target_pct REAL,
-      max_pct REAL,
-      max_single_position_pct REAL,
-      mandate_notes TEXT,
-      PRIMARY KEY (mandate_code, asset_class)
-    );
-
-    CREATE TABLE IF NOT EXISTS transactions (
-      transaction_id TEXT PRIMARY KEY,
-      trade_date TEXT,
-      settlement_date TEXT,
-      portfolio_id TEXT,
-      client_id TEXT,
-      transaction_type TEXT,
-      instrument_id TEXT,
-      instrument_name TEXT,
-      quantity REAL,
-      price_local REAL,
-      currency TEXT,
-      amount REAL,
-      narrative TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS credit_facilities (
-      facility_id TEXT PRIMARY KEY,
-      client_id TEXT,
-      collateral_portfolio_id TEXT,
-      facility_type TEXT,
-      facility_ccy TEXT,
-      credit_limit REAL,
-      interest_rate_pct REAL,
-      margin_call_ltv_pct REAL,
-      utilisation_pct_current REAL
-    );
-
-    CREATE TABLE IF NOT EXISTS commitments (
-      commitment_id TEXT PRIMARY KEY,
-      client_id TEXT,
-      portfolio_id TEXT,
-      fund_name TEXT,
-      currency TEXT,
-      committed REAL,
-      called_to_date REAL,
-      uncalled REAL,
-      expected_call_window TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS planned_cash_needs (
-      need_id TEXT PRIMARY KEY,
-      client_id TEXT,
-      description TEXT,
-      currency TEXT,
-      amount REAL,
-      due_from TEXT,
-      due_to TEXT,
-      recurrence TEXT,
-      certainty TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS market_context (
-      snapshot_date TEXT,
-      series_id TEXT,
-      series_name TEXT,
-      category TEXT,
-      unit TEXT,
-      value REAL,
-      snapshot_label TEXT,
-      PRIMARY KEY (snapshot_date, series_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS events (
-      event_id TEXT PRIMARY KEY,
-      event_date TEXT,
-      event_type TEXT,
-      region TEXT,
-      description TEXT,
-      primary_transmission TEXT,
-      severity TEXT,
-      transmission_tokens TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS rm_notes (
-      note_id TEXT PRIMARY KEY,
-      client_id TEXT,
-      note_date TEXT,
-      rm_id TEXT,
-      rm_name TEXT,
-      channel TEXT,
-      note TEXT
-    );
-
-    -- Derived tables
-    CREATE TABLE IF NOT EXISTS instrument_prices (
-      instrument_id TEXT,
-      snapshot_date TEXT,
-      price REAL,
-      PRIMARY KEY (instrument_id, snapshot_date)
-    );
-
-    CREATE TABLE IF NOT EXISTS portfolio_aum (
-      portfolio_id TEXT,
-      snapshot_date TEXT,
-      aum_base REAL,
-      PRIMARY KEY (portfolio_id, snapshot_date)
-    );
-
-    CREATE TABLE IF NOT EXISTS facility_snapshots (
-      facility_id TEXT,
-      snapshot_date TEXT,
-      drawn REAL,
-      collateral_market_value REAL,
-      lending_value REAL,
-      ltv_pct REAL,
-      headroom REAL,
-      PRIMARY KEY (facility_id, snapshot_date)
-    );
-
-    CREATE TABLE IF NOT EXISTS fx_rates (
-      snapshot_date TEXT,
-      ccy TEXT,
-      usd_per_unit REAL,
-      PRIMARY KEY (snapshot_date, ccy)
-    );
-
-    CREATE TABLE IF NOT EXISTS data_quality_flags (
-      flag_id TEXT PRIMARY KEY,
-      severity TEXT,
-      scope_type TEXT,
-      scope_id TEXT,
-      code TEXT,
-      description TEXT,
-      source_ref TEXT
-    );
-
-    -- Pipeline output tables
-    CREATE TABLE IF NOT EXISTS signals (
-      signal_id TEXT PRIMARY KEY,
-      client_id TEXT,
-      payload TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS groundings (
-      signal_id TEXT PRIMARY KEY,
-      payload TEXT,
-      input_hash TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS narratives (
-      client_id TEXT PRIMARY KEY,
-      payload TEXT,
-      input_hash TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS diversification_plans (
-      plan_id TEXT PRIMARY KEY,
-      signal_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      input_hash TEXT NOT NULL,
-      generated_at TEXT NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_diversification_signal
-      ON diversification_plans(signal_id, generated_at);
-
-    CREATE TABLE IF NOT EXISTS priorities (
-      run_id TEXT,
-      rank INTEGER,
-      client_id TEXT,
-      payload TEXT,
-      PRIMARY KEY (run_id, client_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS audit_log (
-      entry_id TEXT PRIMARY KEY,
-      ts TEXT,
-      rm_id TEXT,
-      action TEXT,
-      target_type TEXT,
-      target_id TEXT,
-      client_id TEXT,
-      before TEXT,
-      after TEXT,
-      reason_code TEXT,
-      reason_text TEXT,
-      confidence_at_decision INTEGER,
-      prompt_version TEXT,
-      model TEXT,
-      input_hash TEXT,
-      context_pack_hash TEXT,
-      source_refs TEXT,
-      prev_hash TEXT,
-      hash TEXT
-    );
-  `);
+async function clearSeededData(db: Queryable): Promise<void> {
+  const tables = [
+    "groundings",
+    "diversification_plans",
+    "priorities",
+    "narratives",
+    "signals",
+    "data_quality_flags",
+    "rm_notes",
+    "planned_cash_needs",
+    "commitments",
+    "facility_snapshots",
+    "credit_facilities",
+    "transactions",
+    "instrument_prices",
+    "portfolio_aum",
+    "holdings",
+    "mandates",
+    "instruments",
+    "market_context",
+    "events",
+    "portfolios",
+    "clients",
+  ];
+  for (const table of tables) {
+    await db.query(`DELETE FROM ${table}`);
+  }
 }
 
-function ingestData(db: Database.Database) {
+async function upsertRows(
+  db: Queryable,
+  table: string,
+  columns: string[],
+  conflictColumns: string[],
+  rows: unknown[][],
+): Promise<void> {
+  const batchSize = Math.max(1, Math.floor(20_000 / columns.length));
+  const updateColumns = columns.filter(
+    (column) => !conflictColumns.includes(column),
+  );
+  for (let offset = 0; offset < rows.length; offset += batchSize) {
+    const batch = rows.slice(offset, offset + batchSize);
+    const values = batch.flat().map((value) => value === "" ? null : value);
+    const tuples = batch.map((_, rowIndex) => {
+      const base = rowIndex * columns.length;
+      return `(${columns.map((__, columnIndex) => `$${base + columnIndex + 1}`).join(", ")})`;
+    });
+    const update = updateColumns
+      .map((column) => `${column} = EXCLUDED.${column}`)
+      .join(", ");
+    await db.query(
+      `INSERT INTO ${table} (${columns.join(", ")})
+       VALUES ${tuples.join(", ")}
+       ON CONFLICT (${conflictColumns.join(", ")}) DO UPDATE SET ${update}`,
+      values,
+    );
+  }
+}
+
+async function ingestData(db: Queryable) {
   console.log("Loading source files...");
 
   // Load all files
@@ -349,15 +123,14 @@ function ingestData(db: Database.Database) {
   console.log(`Loaded ${holdings.length} holdings`);
   console.log(`Loaded ${eventLog.length} events`);
 
-  // Insert clients
-  const clientStmt = db.prepare(`
-    INSERT OR REPLACE INTO clients VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-    )
-  `);
-
-  for (const c of clients) {
-    clientStmt.run(
+  await upsertRows(db, "clients", [
+    "client_id", "client_name", "age", "gender", "nationality",
+    "country_of_residence", "tax_domicile", "booking_centre", "rm_id",
+    "rm_name", "rm_desk", "base_currency", "wealth_band", "total_aum_usd",
+    "life_stage", "source_of_wealth", "risk_profile", "risk_tolerance_score",
+    "investment_horizon_years", "liquidity_needs", "objectives", "client_since",
+    "kyc_review_due", "pep_status", "reporting_language",
+  ], ["client_id"], clients.map((c) => [
       c.client_id, c.client_name, c.age, c.gender, c.nationality,
       c.country_of_residence, c.tax_domicile, c.booking_centre,
       c.rm_id, c.rm_name, c.rm_desk, c.base_currency, c.wealth_band,
@@ -365,45 +138,40 @@ function ingestData(db: Database.Database) {
       c.risk_tolerance_score, c.investment_horizon_years, c.liquidity_needs,
       c.objectives, c.client_since, c.kyc_review_due, c.pep_status,
       c.reporting_language
-    );
-  }
-
-  // Extract aum columns for portfolios
-  const portfolioStmt = db.prepare(`
-    INSERT OR REPLACE INTO portfolios VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const aumStmt = db.prepare(`
-    INSERT OR REPLACE INTO portfolio_aum VALUES (?, ?, ?)
-  `);
+  ]));
 
   const snapshots = ["2025-12-31", "2026-02-27", "2026-03-31", "2026-06-30", "2026-08-26"];
-
-  for (const p of portfolios) {
-    portfolioStmt.run(
+  await upsertRows(db, "portfolios", [
+    "portfolio_id", "client_id", "portfolio_name", "mandate_code",
+    "mandate_name", "service_model", "base_currency", "inception_date",
+    "benchmark", "aum_usd_current",
+  ], ["portfolio_id"], portfolios.map((p) => [
       p.portfolio_id, p.client_id, p.portfolio_name, p.mandate_code,
       p.mandate_name, p.service_model, p.base_currency, p.inception_date,
       p.benchmark, p.aum_usd_current
-    );
+  ]));
+  const portfolioAum = portfolios.flatMap((p) =>
+    snapshots
+      .filter((snapshot) => p[`aum_${snapshot}`] != null)
+      .map((snapshot) => [p.portfolio_id, snapshot, p[`aum_${snapshot}`]]),
+  );
+  await upsertRows(
+    db,
+    "portfolio_aum",
+    ["portfolio_id", "snapshot_date", "aum_base"],
+    ["portfolio_id", "snapshot_date"],
+    portfolioAum,
+  );
 
-    // Unpivot AUM columns
-    for (const snap of snapshots) {
-      const key = `aum_${snap}`;
-      if (p[key] != null) {
-        aumStmt.run(p.portfolio_id, snap, p[key]);
-      }
-    }
-  }
-
-  // Insert holdings
-  const holdingsStmt = db.prepare(`
-    INSERT OR REPLACE INTO holdings VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-    )
-  `);
-
-  for (const h of holdings) {
-    holdingsStmt.run(
+  await upsertRows(db, "holdings", [
+    "snapshot_date", "portfolio_id", "client_id", "instrument_id",
+    "instrument_name", "asset_class", "sub_asset_class", "sector", "region",
+    "instrument_ccy", "quantity", "price_local", "market_value_local",
+    "portfolio_ccy", "market_value_base", "market_value_usd", "weight_pct",
+    "avg_cost_local", "cost_basis_base", "unrealised_pnl_base",
+    "unrealised_pnl_pct", "lending_value_base", "advance_rate_pct",
+    "liquidity_tier", "valuation_date", "acquired_date",
+  ], ["snapshot_date", "portfolio_id", "instrument_id"], holdings.map((h) => [
       h.snapshot_date, h.portfolio_id, h.client_id, h.instrument_id,
       h.instrument_name, h.asset_class, h.sub_asset_class, h.sector, h.region,
       h.instrument_ccy, h.quantity, h.price_local, h.market_value_local,
@@ -411,129 +179,107 @@ function ingestData(db: Database.Database) {
       h.avg_cost_local, h.cost_basis_base, h.unrealised_pnl_base,
       h.unrealised_pnl_pct, h.lending_value_base, h.advance_rate_pct,
       h.liquidity_tier, h.valuation_date, h.acquired_date
-    );
-  }
+  ]));
 
-  // Insert instruments and unpivot prices
-  const instStmt = db.prepare(`
-    INSERT OR REPLACE INTO instruments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const priceStmt = db.prepare(`
-    INSERT OR REPLACE INTO instrument_prices VALUES (?, ?, ?)
-  `);
-
-  for (const i of instruments) {
-    instStmt.run(
+  await upsertRows(db, "instruments", [
+    "instrument_id", "instrument_name", "asset_class", "sub_asset_class",
+    "sector", "region", "currency", "liquidity_tier", "underlying_reference",
+    "sustainability_excluded", "concentration_limit_applies",
+  ], ["instrument_id"], instruments.map((i) => [
       i.instrument_id, i.instrument_name, i.asset_class, i.sub_asset_class,
       i.sector, i.region, i.currency, i.liquidity_tier, i.underlying_reference,
       i.sustainability_excluded, i.concentration_limit_applies
-    );
+  ]));
+  const prices = instruments.flatMap((instrument) =>
+    snapshots
+      .filter((snapshot) => instrument[`price_${snapshot}`] != null)
+      .map((snapshot) => [
+        instrument.instrument_id,
+        snapshot,
+        instrument[`price_${snapshot}`],
+      ]),
+  );
+  await upsertRows(
+    db,
+    "instrument_prices",
+    ["instrument_id", "snapshot_date", "price"],
+    ["instrument_id", "snapshot_date"],
+    prices,
+  );
 
-    // Unpivot price columns
-    for (const snap of snapshots) {
-      const key = `price_${snap}`;
-      if (i[key] != null) {
-        priceStmt.run(i.instrument_id, snap, i[key]);
-      }
-    }
-  }
-
-  // Insert mandates
-  const mandateStmt = db.prepare(`
-    INSERT OR REPLACE INTO mandates VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  for (const m of mandates) {
-    mandateStmt.run(
+  await upsertRows(db, "mandates", [
+    "mandate_code", "mandate_name", "asset_class", "min_pct", "target_pct",
+    "max_pct", "max_single_position_pct", "mandate_notes",
+  ], ["mandate_code", "asset_class"], mandates.map((m) => [
       m.mandate_code, m.mandate_name, m.asset_class, m.min_pct, m.target_pct,
       m.max_pct, m.max_single_position_pct, m.mandate_notes
-    );
-  }
+  ]));
 
-  // Insert transactions
-  const txnStmt = db.prepare(`
-    INSERT OR REPLACE INTO transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  for (const t of transactions) {
-    txnStmt.run(
+  await upsertRows(db, "transactions", [
+    "transaction_id", "trade_date", "settlement_date", "portfolio_id",
+    "client_id", "transaction_type", "instrument_id", "instrument_name",
+    "quantity", "price_local", "currency", "amount", "narrative",
+  ], ["transaction_id"], transactions.map((t) => [
       t.transaction_id, t.trade_date, t.settlement_date, t.portfolio_id,
       t.client_id, t.transaction_type, t.instrument_id, t.instrument_name,
       t.quantity, t.price_local, t.currency, t.amount, t.narrative
-    );
-  }
+  ]));
 
-  // Insert facilities and unpivot snapshots
-  const facilityStmt = db.prepare(`
-    INSERT OR REPLACE INTO credit_facilities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const facilitySnapStmt = db.prepare(`
-    INSERT OR REPLACE INTO facility_snapshots VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  for (const f of facilities) {
-    facilityStmt.run(
+  await upsertRows(db, "credit_facilities", [
+    "facility_id", "client_id", "collateral_portfolio_id", "facility_type",
+    "facility_ccy", "credit_limit", "interest_rate_pct", "margin_call_ltv_pct",
+    "utilisation_pct_current",
+  ], ["facility_id"], facilities.map((f) => [
       f.facility_id, f.client_id, f.collateral_portfolio_id, f.facility_type,
       f.facility_ccy, f.credit_limit, f.interest_rate_pct, f.margin_call_ltv_pct,
       f.utilisation_pct_current
-    );
+  ]));
+  const facilitySnapshots = facilities.flatMap((facility) =>
+    snapshots.map((snapshot) => [
+      facility.facility_id,
+      snapshot,
+      facility[`drawn_${snapshot}`],
+      facility[`collateral_market_value_${snapshot}`],
+      facility[`lending_value_${snapshot}`],
+      facility[`ltv_pct_${snapshot}`],
+      facility[`headroom_${snapshot}`],
+    ]),
+  );
+  await upsertRows(
+    db,
+    "facility_snapshots",
+    ["facility_id", "snapshot_date", "drawn", "collateral_market_value",
+      "lending_value", "ltv_pct", "headroom"],
+    ["facility_id", "snapshot_date"],
+    facilitySnapshots,
+  );
 
-    // Unpivot facility snapshots
-    for (const snap of snapshots) {
-      facilitySnapStmt.run(
-        f.facility_id, snap,
-        f[`drawn_${snap}`],
-        f[`collateral_market_value_${snap}`],
-        f[`lending_value_${snap}`],
-        f[`ltv_pct_${snap}`],
-        f[`headroom_${snap}`]
-      );
-    }
-  }
-
-  // Insert commitments
-  const commitmentStmt = db.prepare(`
-    INSERT OR REPLACE INTO commitments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  for (const c of commitments) {
-    commitmentStmt.run(
+  await upsertRows(db, "commitments", [
+    "commitment_id", "client_id", "portfolio_id", "fund_name", "currency",
+    "committed", "called_to_date", "uncalled", "expected_call_window",
+  ], ["commitment_id"], commitments.map((c) => [
       c.commitment_id, c.client_id, c.portfolio_id, c.fund_name, c.currency,
       c.committed, c.called_to_date, c.uncalled, c.expected_call_window
-    );
-  }
+  ]));
 
-  // Insert cash needs
-  const needStmt = db.prepare(`
-    INSERT OR REPLACE INTO planned_cash_needs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  for (const n of cashNeeds) {
-    needStmt.run(
+  await upsertRows(db, "planned_cash_needs", [
+    "need_id", "client_id", "description", "currency", "amount", "due_from",
+    "due_to", "recurrence", "certainty",
+  ], ["need_id"], cashNeeds.map((n) => [
       n.need_id, n.client_id, n.description, n.currency, n.amount,
       n.due_from, n.due_to, n.recurrence, n.certainty
-    );
-  }
+  ]));
 
-  // Insert market context
-  const marketStmt = db.prepare(`
-    INSERT OR REPLACE INTO market_context VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  for (const m of marketContext) {
-    marketStmt.run(
+  await upsertRows(db, "market_context", [
+    "snapshot_date", "series_id", "series_name", "category", "unit", "value",
+    "snapshot_label",
+  ], ["snapshot_date", "series_id"], marketContext.map((m) => [
       m.snapshot_date, m.series_id, m.series_name, m.category, m.unit,
       m.value, m.snapshot_label
-    );
-  }
+  ]));
 
   // Process FX rates - normalize to usd_per_unit
-  const fxStmt = db.prepare(`
-    INSERT OR REPLACE INTO fx_rates VALUES (?, ?, ?)
-  `);
-
+  const fxRates: unknown[][] = [];
   const fxPairs = marketContext.filter(m => m.category === "FX");
   for (const fx of fxPairs) {
     const pair = String(fx.series_id ?? "");
@@ -556,20 +302,21 @@ function ingestData(db: Database.Database) {
     }
 
     if (ccy) {
-      fxStmt.run(fx.snapshot_date, ccy, usdPerUnit);
+      fxRates.push([fx.snapshot_date, ccy, usdPerUnit]);
     }
   }
-
-  // Add USD itself
   for (const snap of snapshots) {
-    fxStmt.run(snap, "USD", 1.0);
+    fxRates.push([snap, "USD", 1.0]);
   }
+  await upsertRows(
+    db,
+    "fx_rates",
+    ["snapshot_date", "ccy", "usd_per_unit"],
+    ["snapshot_date", "ccy"],
+    fxRates,
+  );
 
   // Process events - synthesize event_id and tokenize
-  const eventStmt = db.prepare(`
-    INSERT OR REPLACE INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
   // Sort events by date then description for deterministic IDs
   const sortedEvents = eventLog.sort((a, b) => {
     const aDate = String(a.event_date ?? "");
@@ -580,8 +327,7 @@ function ingestData(db: Database.Database) {
     return String(a.description ?? "") < String(b.description ?? "") ? -1 : 1;
   });
 
-  for (let i = 0; i < sortedEvents.length; i++) {
-    const e = sortedEvents[i];
+  const events = sortedEvents.map((e, i) => {
     const eventId = `EVT-${String(i + 1).padStart(3, "0")}`;
 
     // Tokenize transmission
@@ -591,105 +337,104 @@ function ingestData(db: Database.Database) {
       .map((s: string) => s.trim())
       .filter((s: string) => s.length > 0);
 
-    eventStmt.run(
+    return [
       eventId, e.event_date, e.event_type, e.region, e.description,
       e.primary_transmission, e.severity, JSON.stringify(tokens)
-    );
-  }
+    ];
+  });
+  await upsertRows(db, "events", [
+    "event_id", "event_date", "event_type", "region", "description",
+    "primary_transmission", "severity", "transmission_tokens",
+  ], ["event_id"], events);
 
-  // Insert RM notes
-  const noteStmt = db.prepare(`
-    INSERT OR REPLACE INTO rm_notes VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  for (const n of rmNotes) {
-    noteStmt.run(
+  await upsertRows(db, "rm_notes", [
+    "note_id", "client_id", "note_date", "rm_id", "rm_name", "channel", "note",
+  ], ["note_id"], rmNotes.map((n) => [
       n.note_id, n.client_id, n.note_date, n.rm_id, n.rm_name, n.channel, n.note
-    );
-  }
+  ]));
 
   console.log("✓ All source data ingested");
 }
 
-function detectDataQualityFlags(db: Database.Database) {
+async function detectDataQualityFlags(db: Queryable) {
   console.log("Detecting data quality flags...");
 
-  const flagStmt = db.prepare(`
-    INSERT OR REPLACE INTO data_quality_flags VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
   // Missing cost basis
-  const missingCost = db.prepare(`
+  const missingCost = (await db.query<MissingCostRow>(`
     SELECT DISTINCT snapshot_date, portfolio_id, client_id, instrument_id, instrument_name
     FROM holdings
     WHERE avg_cost_local IS NULL AND cost_basis_base IS NULL
     AND snapshot_date = '2026-08-26'
-  `).all() as MissingCostRow[];
+  `)).rows;
 
-  for (const row of missingCost) {
+  const flags: unknown[][] = missingCost.map((row) => {
     const id = `FLAG-COST-${row.portfolio_id}-${row.instrument_id}`;
-    flagStmt.run(
+    return [
       id, "error", "position", `${row.portfolio_id}:${row.instrument_id}`,
       "MISSING_COST_BASIS",
       `Cost basis not provided for ${row.instrument_name}. Tax analysis unavailable.`,
       `holdings.csv:${row.snapshot_date}:${row.portfolio_id}:${row.instrument_id}`
-    );
-  }
+    ];
+  });
 
   // Pre-relationship snapshots (PF-0005)
-  const preRelSnaps = db.prepare(`
+  const preRelSnaps = (await db.query<PreRelationshipRow>(`
     SELECT DISTINCT h.portfolio_id, h.client_id, h.snapshot_date, c.client_since
     FROM holdings h
     JOIN clients c ON h.client_id = c.client_id
     WHERE h.snapshot_date < c.client_since
-  `).all() as PreRelationshipRow[];
+  `)).rows;
 
   for (const row of preRelSnaps) {
     const id = `FLAG-PREREL-${row.portfolio_id}`;
-    flagStmt.run(
+    flags.push([
       id, "warning", "portfolio", row.portfolio_id,
       "PRE_RELATIONSHIP_SNAPSHOT",
       `Holdings exist at ${row.snapshot_date}, before client_since ${row.client_since}. Baseline shifted.`,
       `holdings.csv:${row.portfolio_id}:${row.snapshot_date}`
-    );
+    ]);
   }
 
   // Lagged private marks
   const laggedMarks = ["SYN-AL-0301", "SYN-AL-0305", "SYN-AL-0308"];
   for (const inst of laggedMarks) {
     const id = `FLAG-LAG-${inst}`;
-    flagStmt.run(
+    flags.push([
       id, "warning", "position", inst,
       "LAGGED_PRIVATE_MARK",
       "Private markets valuation lags by one quarter. Current mark may not reflect recent performance.",
       `instruments.csv:${inst}`
-    );
+    ]);
   }
+  await upsertRows(db, "data_quality_flags", [
+    "flag_id", "severity", "scope_type", "scope_id", "code", "description",
+    "source_ref",
+  ], ["flag_id"], flags);
 
   console.log(`✓ Detected ${missingCost.length + preRelSnaps.length + laggedMarks.length} data quality flags`);
 }
 
-function main() {
+async function main() {
   console.log("=== Verity Data Ingestion ===\n");
 
-  const db = getDb();
+  const db = createAdminDb();
 
   try {
-    console.log("Creating tables...");
-    createTables(db);
-
-    console.log("Ingesting data...");
-    ingestData(db);
-
-    console.log("Detecting data quality issues...");
-    detectDataQualityFlags(db);
+    await withTransaction(db, async (client) => {
+      console.log("Clearing previously seeded source and derived data...");
+      await clearSeededData(client);
+      console.log("Ingesting data...");
+      await ingestData(client);
+      console.log("Detecting data quality issues...");
+      await detectDataQualityFlags(client);
+    });
 
     // Print summary
     const counts = {
-      clients: db.prepare("SELECT COUNT(*) as count FROM clients").get() as CountRow,
-      holdings: db.prepare("SELECT COUNT(*) as count FROM holdings").get() as CountRow,
-      events: db.prepare("SELECT COUNT(*) as count FROM events").get() as CountRow,
-      flags: db.prepare("SELECT COUNT(*) as count FROM data_quality_flags").get() as CountRow,
+      clients: (await db.query<CountRow>("SELECT COUNT(*) AS count FROM clients")).rows[0],
+      holdings: (await db.query<CountRow>("SELECT COUNT(*) AS count FROM holdings")).rows[0],
+      events: (await db.query<CountRow>("SELECT COUNT(*) AS count FROM events")).rows[0],
+      flags: (await db.query<CountRow>("SELECT COUNT(*) AS count FROM data_quality_flags")).rows[0],
     };
 
     console.log("\n=== Ingestion Summary ===");
@@ -699,8 +444,11 @@ function main() {
     console.log(`DQ Flags:    ${counts.flags.count}`);
     console.log("\n✓ Ingestion complete");
   } finally {
-    closeDb();
+    await db.end();
   }
 }
 
-main();
+main().catch((error) => {
+  console.error("Ingestion failed:", error);
+  process.exitCode = 1;
+});

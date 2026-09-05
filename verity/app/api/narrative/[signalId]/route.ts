@@ -1,13 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createHash } from "crypto";
-import { getDb } from "@/lib/db/client";
 import {
   attachNarrativeSuitability,
   NarrativeAgent,
   NARRATIVE_PROMPT_VERSION,
 } from "@/lib/agents/narrativeAgent";
 import { stripInternalReferenceTagsDeep } from "@/lib/agents/outputSanitizer";
-import type { Signal } from "@/lib/contracts/signal";
 import { Repository } from "@/lib/db/repository";
 import { requireApiSession } from "@/lib/security/auth";
 import { requireSignalAccess } from "@/lib/security/access";
@@ -39,37 +37,40 @@ export async function POST(
   request: NextRequest,
   context: { params: Promise<{ signalId: string }> }
 ) {
-  let releaseConcurrency: (() => void) | undefined;
+  let releaseConcurrency: (() => Promise<void>) | undefined;
+  const releaseLease = async () => {
+    const release = releaseConcurrency;
+    releaseConcurrency = undefined;
+    if (!release) return;
+    try {
+      await release();
+    } catch (error) {
+      console.error("Unable to release narrative concurrency lease:", error);
+    }
+  };
   try {
     const session = await requireApiSession();
     assertSameOrigin(request);
-    enforceRateLimit(request, {
+    await enforceRateLimit(request, {
       bucket: "narrative",
       limit: 10,
       windowMs: 5 * 60_000,
       rmId: session.rmId,
     });
-    reserveDailyAiBudget(session.rmId, 3_000);
-    releaseConcurrency = acquireConcurrency(`narrative:${session.rmId}`, 2);
+    releaseConcurrency = await acquireConcurrency(`narrative:${session.rmId}`, 2);
+    await reserveDailyAiBudget(session.rmId, 3_000);
     const { signalId } = await context.params;
-    requireSignalAccess(new Repository(), session.rmId, signalId);
-    const db = getDb();
+    const repository = new Repository();
+    await requireSignalAccess(repository, session.rmId, signalId);
 
-    // Get signal
-    const signalRow = db
-      .prepare("SELECT payload, client_id FROM signals WHERE signal_id = ?")
-      .get(signalId) as { payload: string; client_id: string } | undefined;
-
-    if (!signalRow) {
+    const signal = await repository.getSignal(signalId);
+    if (!signal) {
       return NextResponse.json({ error: "Signal not found" }, { status: 404 });
     }
 
-    const signal: Signal = JSON.parse(signalRow.payload);
-
-    // Get client context
-    const client = db
-      .prepare("SELECT * FROM clients WHERE client_id = ?")
-      .get(signal.client_id) as NarrativeClientContext | undefined;
+    const client = (await repository.getClient(
+      signal.client_id,
+    )) as NarrativeClientContext | undefined;
     if (!client) {
       return NextResponse.json({ error: "Client not found" }, { status: 404 });
     }
@@ -83,25 +84,16 @@ export async function POST(
       )
       .digest("hex");
 
-    // Check if we already have a narrative cached
-    const cached = db
-      .prepare("SELECT payload, input_hash FROM narratives WHERE client_id = ?")
-      .get(signal.client_id) as
-      | { payload: string; input_hash: string | null }
-      | undefined;
+    const cached = await repository.getNarrativeRow(signal.client_id);
 
     if (cached) {
-      const narratives = JSON.parse(cached.payload);
-      let inputHashes: Record<string, string> = {};
-      try {
-        inputHashes = JSON.parse(cached.input_hash ?? "{}");
-      } catch {
-        inputHashes = {};
-      }
-      if (narratives[signalId] && inputHashes[signalId] === inputHash) {
+      if (
+        cached.payload[signalId] &&
+        cached.input_hash[signalId] === inputHash
+      ) {
         return NextResponse.json(
           stripInternalReferenceTagsDeep(
-            attachNarrativeSuitability(narratives[signalId]),
+            attachNarrativeSuitability(cached.payload[signalId]),
           ),
         );
       }
@@ -110,7 +102,7 @@ export async function POST(
     // Generate narrative
     const agent = new NarrativeAgent();
     const narrative = await agent.generateNarrative(signal, client);
-    writeSecurityAuditEvent({
+    await writeSecurityAuditEvent({
       rmId: session.rmId,
       eventType: "model_response",
       target: "narrative",
@@ -124,22 +116,15 @@ export async function POST(
     });
 
     // Cache it
-    const allNarratives = cached ? JSON.parse(cached.payload) : {};
+    const allNarratives = { ...(cached?.payload ?? {}) };
     allNarratives[signalId] = narrative;
-    let allInputHashes: Record<string, string> = {};
-    try {
-      allInputHashes = JSON.parse(cached?.input_hash ?? "{}");
-    } catch {
-      allInputHashes = {};
-    }
+    const allInputHashes = { ...(cached?.input_hash ?? {}) };
     allInputHashes[signalId] = inputHash;
 
-    db.prepare(
-      "INSERT OR REPLACE INTO narratives (client_id, payload, input_hash) VALUES (?, ?, ?)"
-    ).run(
+    await repository.saveNarrativeRow(
       signal.client_id,
-      JSON.stringify(allNarratives),
-      JSON.stringify(allInputHashes),
+      allNarratives,
+      allInputHashes,
     );
 
     return NextResponse.json(stripInternalReferenceTagsDeep(narrative));
@@ -148,6 +133,6 @@ export async function POST(
     if (securityResponse) return securityResponse;
     return internalErrorResponse("Failed to generate narrative", error);
   } finally {
-    releaseConcurrency?.();
+    await releaseLease();
   }
 }

@@ -1,36 +1,51 @@
-import { getDb, closeDb } from "../lib/db/client";
+import { createAdminDb } from "../lib/db/client";
+import { loadEnvConfig } from "@next/env";
 
-function verify() {
+loadEnvConfig(process.cwd());
+
+type CountRow = { count: string };
+
+async function verify() {
   console.log("=== Verity Verification ===\n");
 
-  const db = getDb();
+  const db = createAdminDb();
 
   try {
     // Check database exists and has data
     const counts = {
-      clients: db.prepare("SELECT COUNT(*) as count FROM clients").get() as { count: number },
-      holdings: db.prepare("SELECT COUNT(*) as count FROM holdings").get() as { count: number },
-      signals: db.prepare("SELECT COUNT(*) as count FROM signals").get() as { count: number },
-      events: db.prepare("SELECT COUNT(*) as count FROM events").get() as { count: number },
-      flags: db.prepare("SELECT COUNT(*) as count FROM data_quality_flags").get() as { count: number },
+      clients: Number((await db.query<CountRow>("SELECT COUNT(*) AS count FROM clients")).rows[0].count),
+      holdings: Number((await db.query<CountRow>("SELECT COUNT(*) AS count FROM holdings")).rows[0].count),
+      signals: Number((await db.query<CountRow>("SELECT COUNT(*) AS count FROM signals")).rows[0].count),
+      events: Number((await db.query<CountRow>("SELECT COUNT(*) AS count FROM events")).rows[0].count),
+      flags: Number((await db.query<CountRow>("SELECT COUNT(*) AS count FROM data_quality_flags")).rows[0].count),
     };
 
     console.log("📊 Database Check:");
-    console.log(`  ✓ Clients: ${counts.clients.count} ${counts.clients.count === 20 ? '✓' : '❌ Expected 20'}`);
-    console.log(`  ✓ Holdings: ${counts.holdings.count} ${counts.holdings.count >= 1000 ? '✓' : '❌ Expected ~1015'}`);
-    console.log(`  ✓ Events: ${counts.events.count} ${counts.events.count === 16 ? '✓' : '❌ Expected 16'}`);
-    console.log(`  ✓ Signals: ${counts.signals.count} ${counts.signals.count > 0 ? '✓' : '❌ Run pipeline first!'}`);
-    console.log(`  ✓ Flags: ${counts.flags.count} ${counts.flags.count > 0 ? '✓' : '❌'}`);
+    console.log(`  ✓ Clients: ${counts.clients} ${counts.clients === 20 ? '✓' : '❌ Expected 20'}`);
+    console.log(`  ✓ Holdings: ${counts.holdings} ${counts.holdings >= 1000 ? '✓' : '❌ Expected ~1015'}`);
+    console.log(`  ✓ Events: ${counts.events} ${counts.events === 16 ? '✓' : '❌ Expected 16'}`);
+    console.log(`  ✓ Signals: ${counts.signals} ${counts.signals > 0 ? '✓' : '❌ Run pipeline first!'}`);
+    console.log(`  ✓ Flags: ${counts.flags} ${counts.flags > 0 ? '✓' : '❌'}`);
 
     // Check demo clients exist
     console.log("\n🎯 Demo Clients:");
     const demoClients = ['CL-0001', 'CL-0003', 'CL-0012'];
     for (const clientId of demoClients) {
-      const client = db.prepare("SELECT client_name FROM clients WHERE client_id = ?").get(clientId) as { client_name: string } | undefined;
-      const signals = db.prepare("SELECT COUNT(*) as count FROM signals WHERE client_id = ?").get(clientId) as { count: number };
+      const client = (
+        await db.query<{ client_name: string }>(
+          "SELECT client_name FROM clients WHERE client_id = $1",
+          [clientId],
+        )
+      ).rows[0];
+      const signals = Number((
+        await db.query<CountRow>(
+          "SELECT COUNT(*) AS count FROM signals WHERE client_id = $1",
+          [clientId],
+        )
+      ).rows[0].count);
       
       if (client) {
-        console.log(`  ✓ ${clientId} (${client.client_name}): ${signals.count} signals`);
+        console.log(`  ✓ ${clientId} (${client.client_name}): ${signals} signals`);
       } else {
         console.log(`  ❌ ${clientId}: Not found`);
       }
@@ -38,7 +53,9 @@ function verify() {
 
     // Check signals have proper structure
     console.log("\n🔍 Signal Validation:");
-    const sampleSignal = db.prepare("SELECT payload FROM signals LIMIT 1").get() as { payload: string } | undefined;
+    const sampleSignal = (
+      await db.query<{ payload: string }>("SELECT payload FROM signals LIMIT 1")
+    ).rows[0];
     
     if (sampleSignal) {
       const signal = JSON.parse(sampleSignal.payload);
@@ -52,11 +69,11 @@ function verify() {
 
     // Overall status
     const allGood = 
-      counts.clients.count === 20 &&
-      counts.holdings.count >= 1000 &&
-      counts.events.count === 16 &&
-      counts.signals.count > 0 &&
-      counts.flags.count > 0;
+      counts.clients === 20 &&
+      counts.holdings >= 1000 &&
+      counts.events === 16 &&
+      counts.signals > 0 &&
+      counts.flags > 0;
 
     console.log("\n" + "=".repeat(40));
     if (allGood) {
@@ -66,7 +83,8 @@ function verify() {
       console.log("Then open: http://localhost:3000");
     } else {
       console.log("⚠️  VERIFICATION INCOMPLETE");
-      if (counts.signals.count === 0) {
+      process.exitCode = 1;
+      if (counts.signals === 0) {
         console.log("\nNext step: npm run pipeline");
       }
     }
@@ -74,12 +92,16 @@ function verify() {
 
   } catch (error) {
     console.error("❌ Verification failed:", error);
+    process.exitCode = 1;
     console.log("\nTry running:");
     console.log("  1. npm run ingest");
     console.log("  2. npm run pipeline");
   } finally {
-    closeDb();
+    await db.end();
   }
 }
 
-verify();
+verify().catch((error) => {
+  console.error("Verification failed:", error);
+  process.exitCode = 1;
+});

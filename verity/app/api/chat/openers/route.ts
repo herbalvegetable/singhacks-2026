@@ -10,13 +10,19 @@ import { enforceRateLimit } from "@/lib/security/abuse";
 
 export const dynamic = "force-dynamic";
 
-export function buildOpeners(clientId: string, repository = new Repository()) {
-  const client = repository.getClient(clientId);
+export async function buildOpeners(
+  clientId: string,
+  repository = new Repository(),
+) {
+  const [client, clientSignals] = await Promise.all([
+    repository.getClient(clientId),
+    repository.getSignalsForClient(clientId),
+  ]);
   if (!client) throw new Error("Client not found");
 
-  const signals = repository
-    .getSignalsForClient(clientId)
-    .sort((a, b) => b.urgency_score - a.urgency_score);
+  const signals = clientSignals.sort(
+    (a, b) => b.urgency_score - a.urgency_score,
+  );
 
   const questions = signals.slice(0, 3).map((signal) => {
     if (signal.type === "risk") {
@@ -42,7 +48,7 @@ export function buildOpeners(clientId: string, repository = new Repository()) {
 export async function GET(request: NextRequest) {
   try {
     const session = await requireApiSession();
-    enforceRateLimit(request, {
+    await enforceRateLimit(request, {
       bucket: "chat-openers",
       limit: 60,
       windowMs: 5 * 60_000,
@@ -53,8 +59,10 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Valid clientId required" }, { status: 400 });
     }
     const repository = new Repository();
-    requireClientAccess(repository, session.rmId, clientId);
-    return NextResponse.json({ questions: buildOpeners(clientId, repository) });
+    await requireClientAccess(repository, session.rmId, clientId);
+    return NextResponse.json({
+      questions: await buildOpeners(clientId, repository),
+    });
   } catch (error) {
     const securityResponse = securityErrorResponse(error);
     if (securityResponse) return securityResponse;

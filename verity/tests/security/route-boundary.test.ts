@@ -21,7 +21,7 @@ test("protected route handlers authenticate before sensitive work", () => {
       .filter((part) => part.startsWith("export async function"));
     assert.ok(handlers.length > 0, `${path} has no route handlers`);
     for (const handler of handlers) {
-      const auth = handler.indexOf("requireApiSession()");
+      const auth = handler.indexOf("await requireApiSession()");
       const firstDatabaseOrAgent = handler.search(
         /\b(?:new Repository|getDb|answerClientQuestion|generate[A-Z]|resolveDecisionTarget)\b/,
       );
@@ -39,9 +39,11 @@ test("protected route handlers authenticate before sensitive work", () => {
 test("protected pages authenticate before database access", () => {
   for (const path of ["app/page.tsx", "app/client/[clientId]/page.tsx"]) {
     const source = readFileSync(resolve(process.cwd(), path), "utf8");
-    const auth = source.indexOf("requirePageSession()");
-    const database = source.indexOf("getDb()", auth);
+    const auth = source.indexOf("await requirePageSession()");
+    const database = source
+      .slice(auth)
+      .search(/\b(?:new Repository|getDb)\b/);
     assert.ok(auth > 0, `${path} is missing requirePageSession`);
-    assert.ok(database > auth, `${path} opens the database before authentication`);
+    assert.ok(database > 0, `${path} opens the database before authentication`);
   }
 });

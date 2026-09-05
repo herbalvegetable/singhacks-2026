@@ -1,5 +1,4 @@
 import Link from "next/link";
-import { getDb } from "@/lib/db/client";
 import type { Signal } from "@/lib/contracts/signal";
 import { SignalCard } from "@/components/verity/SignalCard";
 import { CopilotWidget } from "@/components/copilot/CopilotWidget";
@@ -9,7 +8,7 @@ import {
 } from "@/components/charts/PortfolioAllocationPie";
 import { TopHoldingsPie } from "@/components/charts/TopHoldingsPie";
 import { TopHoldingsList } from "@/components/verity/TopHoldingsList";
-import { Repository, type Holding, type Portfolio } from "@/lib/db/repository";
+import { Repository } from "@/lib/db/repository";
 import { PriorityAutoRefresh } from "@/components/priority/PriorityAutoRefresh";
 import { RiskPriorityBadge } from "@/components/priority/RiskPriorityBadge";
 import { stripInternalReferenceTags } from "@/lib/agents/outputSanitizer";
@@ -21,46 +20,12 @@ interface PageProps {
   params: Promise<{ clientId: string }>;
 }
 
-interface DossierClient {
-  client_id: string;
-  client_name: string;
-  age: number | null;
-  total_aum_usd: number;
-  risk_profile: string;
-  life_stage: string;
-  objectives: string;
-  tax_domicile: string;
-  investment_horizon_years: number;
-  client_since: string;
-}
-
-interface DossierPortfolio extends Portfolio {
-  mandate_name: string;
-}
-
-interface QualityFlag {
-  flag_id: string;
-  severity: "error" | "warning";
-  code: string;
-  description: string;
-}
-
-interface PortfolioAllocationRow {
-  portfolio_id: string;
-  asset_class: string;
-  value_usd: number;
-}
-
 export default async function ClientPage({ params }: PageProps) {
   const { clientId } = await params;
   const session = await requirePageSession();
-  const db = getDb();
   const repository = new Repository();
 
-  // Get client details
-  const client = db
-    .prepare("SELECT * FROM clients WHERE client_id = ? AND rm_id = ?")
-    .get(clientId, session.rmId) as DossierClient | undefined;
+  const client = await repository.getClientForRm(clientId, session.rmId);
 
   if (!client) {
     return (
@@ -75,53 +40,29 @@ export default async function ClientPage({ params }: PageProps) {
     );
   }
 
-  // Get signals
-  const signalRows = db
-    .prepare("SELECT payload FROM signals WHERE client_id = ?")
-    .all(clientId) as { payload: string }[];
-
-  const signals: Signal[] = signalRows
-    .map((s) => JSON.parse(s.payload))
-    .sort((a, b) => b.urgency_score - a.urgency_score);
-  const groundingBySignal = new Map(
-    repository
-      .getGroundingsForClient(clientId)
-      .map((grounding) => [grounding.signal_id, grounding]),
+  const [
+    clientSignals,
+    groundings,
+    portfolios,
+    holdings,
+    allocationRows,
+    flags,
+    priorities,
+  ] = await Promise.all([
+    repository.getSignalsForClient(clientId),
+    repository.getGroundingsForClient(clientId),
+    repository.getPortfoliosForClient(clientId),
+    repository.getLatestHoldingsForClient(clientId),
+    repository.getPortfolioAllocations(clientId),
+    repository.getDossierFlags(clientId),
+    repository.getLatestRiskPrioritiesForRm(session.rmId),
+  ]);
+  const signals: Signal[] = clientSignals.sort(
+    (a, b) => b.urgency_score - a.urgency_score,
   );
-
-  // Get portfolios
-  const portfolios = db
-    .prepare("SELECT * FROM portfolios WHERE client_id = ?")
-    .all(clientId) as DossierPortfolio[];
-
-  // Get holdings (latest snapshot)
-  const holdings = db
-    .prepare(
-      `
-      SELECT * FROM holdings 
-      WHERE client_id = ?
-        AND snapshot_date = (
-          SELECT MAX(snapshot_date) FROM holdings WHERE client_id = ?
-        )
-      ORDER BY market_value_usd DESC
-    `
-    )
-    .all(clientId, clientId) as Holding[];
-
-  const allocationRows = db
-    .prepare(
-      `
-      SELECT portfolio_id, asset_class, SUM(market_value_usd) AS value_usd
-      FROM holdings
-      WHERE client_id = ?
-        AND snapshot_date = (
-          SELECT MAX(snapshot_date) FROM holdings WHERE client_id = ?
-        )
-      GROUP BY portfolio_id, asset_class
-      ORDER BY portfolio_id, value_usd DESC
-    `,
-    )
-    .all(clientId, clientId) as PortfolioAllocationRow[];
+  const groundingBySignal = new Map(
+    groundings.map((grounding) => [grounding.signal_id, grounding]),
+  );
 
   const allocationsByPortfolio = new Map<string, PortfolioAllocationSlice[]>();
   for (const row of allocationRows) {
@@ -133,13 +74,9 @@ export default async function ClientPage({ params }: PageProps) {
     allocationsByPortfolio.set(row.portfolio_id, slices);
   }
 
-  // Get data quality flags
-  const flags = db
-    .prepare("SELECT * FROM data_quality_flags WHERE scope_id LIKE ?")
-    .all(`%${clientId}%`) as QualityFlag[];
-  const priority = repository
-    .getLatestRiskPrioritiesForRm(session.rmId)
-    .find((assessment) => assessment.client_id === clientId);
+  const priority = priorities.find(
+    (assessment) => assessment.client_id === clientId,
+  );
 
   return (
     <div className="relative min-h-screen overflow-x-hidden">

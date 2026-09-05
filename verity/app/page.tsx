@@ -1,5 +1,4 @@
 import Link from "next/link";
-import { getDb } from "@/lib/db/client";
 import type { Grounding, Signal } from "@/lib/contracts/signal";
 import type { StoredRiskPriority } from "@/lib/contracts/priority";
 import { Repository } from "@/lib/db/repository";
@@ -19,73 +18,40 @@ interface ClientWithSignals {
   priority?: StoredRiskPriority;
 }
 
-interface ClientSignalRow {
-  client_id: string;
-  client_name: string;
-  total_aum_usd: number;
-  signal_count: number;
-  payload: string;
-}
-
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
   const session = await requirePageSession();
-  const db = getDb();
   const repository = new Repository();
-  const priorities = repository.getLatestRiskPrioritiesForRm(session.rmId);
+  const [priorities, briefClients] = await Promise.all([
+    repository.getLatestRiskPrioritiesForRm(session.rmId),
+    repository.getMorningBriefClients(session.rmId),
+  ]);
   const priorityByClient = new Map(
     priorities.map((priority) => [priority.client_id, priority]),
   );
 
-  // Get all signals grouped by client
-  const rows = db
-    .prepare(
-      `
-      SELECT 
-        c.client_id,
-        c.client_name,
-        c.total_aum_usd,
-        COUNT(s.signal_id) as signal_count,
-        s.payload
-      FROM clients c
-      LEFT JOIN signals s ON c.client_id = s.client_id
-      WHERE s.signal_id IS NOT NULL AND c.rm_id = ?
-      GROUP BY c.client_id
-      ORDER BY COUNT(s.signal_id) DESC, c.client_name
-    `
-    )
-    .all(session.rmId) as ClientSignalRow[];
-
-  // Get signals for each client
-  const clientsWithSignals: ClientWithSignals[] = [];
-
-  for (const row of rows) {
-    const signals = db
-      .prepare("SELECT payload FROM signals WHERE client_id = ?")
-      .all(row.client_id) as { payload: string }[];
-
-    const parsedSignals: Signal[] = signals.map((s) => JSON.parse(s.payload));
+  const clientsWithSignals: ClientWithSignals[] = await Promise.all(
+    briefClients.map(async (client) => {
     const groundingBySignal = new Map(
-      repository
-        .getGroundingsForClient(row.client_id)
+      (await repository.getGroundingsForClient(client.client_id))
         .map((grounding) => [grounding.signal_id, grounding]),
     );
-    const urgencyMax = parsedSignals.length > 0 
-      ? Math.max(...parsedSignals.map((s) => s.urgency_score))
+    const urgencyMax = client.signals.length > 0
+      ? Math.max(...client.signals.map((signal) => signal.urgency_score))
       : 0;
 
-    clientsWithSignals.push({
-      client_id: row.client_id,
-      client_name: row.client_name,
-      total_aum_usd: row.total_aum_usd,
-      signal_count: signals.length,
+    return {
+      client_id: client.client_id,
+      client_name: client.client_name,
+      total_aum_usd: client.total_aum_usd,
+      signal_count: client.signals.length,
       urgency_max: urgencyMax,
-      signals: parsedSignals,
+      signals: client.signals,
       groundingBySignal,
-      priority: priorityByClient.get(row.client_id),
-    });
-  }
+      priority: priorityByClient.get(client.client_id),
+    };
+  }));
 
   // Use the calibrated book-wide score when available, then deterministic urgency.
   clientsWithSignals.sort(

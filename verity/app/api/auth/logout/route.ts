@@ -15,7 +15,7 @@ export async function POST(request: NextRequest) {
     assertSameOrigin(request);
     const session = await getCurrentSession();
     await revokeCurrentSession();
-    writeSecurityAuditEvent({
+    await writeSecurityAuditEvent({
       rmId: session?.rmId,
       eventType: "session_revoked",
       target: "logout",

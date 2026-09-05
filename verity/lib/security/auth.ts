@@ -27,21 +27,6 @@ export class AuthConfigurationError extends Error {
   }
 }
 
-function ensureSessionTable(): void {
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS auth_sessions (
-      token_hash TEXT PRIMARY KEY,
-      rm_id TEXT NOT NULL,
-      display_name TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      revoked_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry
-      ON auth_sessions(expires_at);
-  `);
-}
-
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -94,23 +79,21 @@ export function authenticateCredentials(
 export async function createSession(
   identity: Omit<AuthSession, "expiresAt">,
 ): Promise<AuthSession> {
-  ensureSessionTable();
   const token = randomBytes(32).toString("base64url");
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + SESSION_TTL_MS);
-  getDb()
-    .prepare(
-      `INSERT INTO auth_sessions
-       (token_hash, rm_id, display_name, created_at, expires_at, revoked_at)
-       VALUES (?, ?, ?, ?, ?, NULL)`,
-    )
-    .run(
+  await getDb().query(
+    `INSERT INTO auth_sessions
+     (token_hash, rm_id, display_name, created_at, expires_at, revoked_at)
+     VALUES ($1, $2, $3, $4, $5, NULL)`,
+    [
       sha256(token),
       identity.rmId,
       identity.displayName,
       createdAt.toISOString(),
       expiresAt.toISOString(),
-    );
+    ],
+  );
   (await cookies()).set(SESSION_COOKIE, token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
@@ -122,23 +105,21 @@ export async function createSession(
 }
 
 export async function getCurrentSession(): Promise<AuthSession | null> {
-  ensureSessionTable();
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) return null;
-  const row = getDb()
-    .prepare(
+  const row = (
+    await getDb().query<{
+      rm_id: string;
+      display_name: string;
+      expires_at: string;
+      revoked_at: string | null;
+    }>(
       `SELECT rm_id, display_name, expires_at, revoked_at
        FROM auth_sessions
-       WHERE token_hash = ?`,
+       WHERE token_hash = $1`,
+      [sha256(token)],
     )
-    .get(sha256(token)) as
-    | {
-        rm_id: string;
-        display_name: string;
-        expires_at: string;
-        revoked_at: string | null;
-      }
-    | undefined;
+  ).rows[0];
   if (!row || !sessionIsActive(row.expires_at, row.revoked_at)) return null;
   return {
     rmId: row.rm_id,
@@ -160,15 +141,15 @@ export async function requirePageSession(): Promise<AuthSession> {
 }
 
 export async function revokeCurrentSession(): Promise<void> {
-  ensureSessionTable();
   const cookieStore = await cookies();
   const token = cookieStore.get(SESSION_COOKIE)?.value;
   if (token) {
-    getDb()
-      .prepare(
-        "UPDATE auth_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
-      )
-      .run(new Date().toISOString(), sha256(token));
+    await getDb().query(
+      `UPDATE auth_sessions
+       SET revoked_at = $1
+       WHERE token_hash = $2 AND revoked_at IS NULL`,
+      [new Date().toISOString(), sha256(token)],
+    );
   }
   cookieStore.delete(SESSION_COOKIE);
 }

@@ -1,8 +1,8 @@
 import "server-only";
 
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import type { NextRequest } from "next/server";
-import { getDb } from "../db/client";
+import { getDb, withTransaction } from "../db/client";
 import { evaluateRateLimit } from "./rateLimitPolicy";
 
 export class RateLimitError extends Error {
@@ -17,24 +17,6 @@ export class BudgetExceededError extends Error {
   }
 }
 
-function ensureTables(): void {
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS request_rate_limits (
-      bucket TEXT NOT NULL,
-      principal_hash TEXT NOT NULL,
-      window_start INTEGER NOT NULL,
-      request_count INTEGER NOT NULL,
-      PRIMARY KEY (bucket, principal_hash)
-    );
-    CREATE TABLE IF NOT EXISTS ai_budget_usage (
-      usage_date TEXT NOT NULL,
-      rm_id TEXT NOT NULL,
-      reserved_tokens INTEGER NOT NULL,
-      PRIMARY KEY (usage_date, rm_id)
-    );
-  `);
-}
-
 function principalHash(request: NextRequest, rmId?: string): string {
   const ip =
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
@@ -45,7 +27,7 @@ function principalHash(request: NextRequest, rmId?: string): string {
     .digest("hex");
 }
 
-export function enforceRateLimit(
+export async function enforceRateLimit(
   request: NextRequest,
   options: {
     bucket: string;
@@ -53,24 +35,29 @@ export function enforceRateLimit(
     windowMs: number;
     rmId?: string;
   },
-): void {
-  ensureTables();
+): Promise<void> {
   const now = Date.now();
   const principal = principalHash(request, options.rmId);
-  const update = getDb().transaction(() => {
-    const current = getDb()
-      .prepare(
+  const lockKey = `rate-limit:${options.bucket}:${principal}`;
+  await withTransaction(getDb(), async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      lockKey,
+    ]);
+    const current = (
+      await client.query<{
+        window_start: string | number;
+        request_count: number;
+      }>(
         `SELECT window_start, request_count
          FROM request_rate_limits
-         WHERE bucket = ? AND principal_hash = ?`,
+         WHERE bucket = $1 AND principal_hash = $2`,
+        [options.bucket, principal],
       )
-      .get(options.bucket, principal) as
-      | { window_start: number; request_count: number }
-      | undefined;
+    ).rows[0];
     const evaluation = evaluateRateLimit(
       current
         ? {
-            windowStart: current.window_start,
+            windowStart: Number(current.window_start),
             count: current.request_count,
           }
         : null,
@@ -81,69 +68,95 @@ export function enforceRateLimit(
     if (!evaluation.allowed) {
       throw new RateLimitError(evaluation.retryAfterSeconds);
     }
-    getDb()
-      .prepare(
-        `INSERT INTO request_rate_limits
-         (bucket, principal_hash, window_start, request_count)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(bucket, principal_hash) DO UPDATE SET
-           window_start = excluded.window_start,
-           request_count = excluded.request_count`,
-      )
-      .run(
+    await client.query(
+      `INSERT INTO request_rate_limits
+       (bucket, principal_hash, window_start, request_count)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT(bucket, principal_hash) DO UPDATE SET
+         window_start = EXCLUDED.window_start,
+         request_count = EXCLUDED.request_count`,
+      [
         options.bucket,
         principal,
         evaluation.state.windowStart,
         evaluation.state.count,
-      );
+      ],
+    );
   });
-  update.immediate();
 }
 
-export function reserveDailyAiBudget(
+export async function reserveDailyAiBudget(
   rmId: string,
   estimatedTokens: number,
-): void {
-  ensureTables();
+): Promise<void> {
   const configured = Number(process.env.VERITY_DAILY_TOKEN_BUDGET ?? "100000");
   const dailyBudget =
     Number.isFinite(configured) && configured > 0 ? configured : 100_000;
   const usageDate = new Date().toISOString().slice(0, 10);
-  const reserve = getDb().transaction(() => {
-    const row = getDb()
-      .prepare(
-        "SELECT reserved_tokens FROM ai_budget_usage WHERE usage_date = ? AND rm_id = ?",
+  const lockKey = `ai-budget:${usageDate}:${rmId}`;
+  await withTransaction(getDb(), async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      lockKey,
+    ]);
+    const row = (
+      await client.query<{ reserved_tokens: number }>(
+        `SELECT reserved_tokens
+         FROM ai_budget_usage
+         WHERE usage_date = $1 AND rm_id = $2
+         FOR UPDATE`,
+        [usageDate, rmId],
       )
-      .get(usageDate, rmId) as { reserved_tokens: number } | undefined;
+    ).rows[0];
     const next = (row?.reserved_tokens ?? 0) + estimatedTokens;
     if (next > dailyBudget) throw new BudgetExceededError();
-    getDb()
-      .prepare(
-        `INSERT INTO ai_budget_usage (usage_date, rm_id, reserved_tokens)
-         VALUES (?, ?, ?)
-         ON CONFLICT(usage_date, rm_id) DO UPDATE SET
-           reserved_tokens = excluded.reserved_tokens`,
-      )
-      .run(usageDate, rmId, next);
+    await client.query(
+      `INSERT INTO ai_budget_usage (usage_date, rm_id, reserved_tokens)
+       VALUES ($1, $2, $3)
+       ON CONFLICT(usage_date, rm_id) DO UPDATE SET
+         reserved_tokens = EXCLUDED.reserved_tokens`,
+      [usageDate, rmId, next],
+    );
   });
-  reserve.immediate();
 }
 
-const activeByPrincipal = new Map<string, number>();
-
-export function acquireConcurrency(
+export async function acquireConcurrency(
   principal: string,
   limit: number,
-): () => void {
-  const active = activeByPrincipal.get(principal) ?? 0;
-  if (active >= limit) throw new RateLimitError(10);
-  activeByPrincipal.set(principal, active + 1);
+  leaseMs = 5 * 60_000,
+): Promise<() => Promise<void>> {
+  const leaseId = randomUUID();
+  const now = Date.now();
+  await withTransaction(getDb(), async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `ai-concurrency:${principal}`,
+    ]);
+    await client.query(
+      "DELETE FROM ai_concurrency_leases WHERE principal = $1 AND expires_at <= $2",
+      [principal, now],
+    );
+    const active = Number(
+      (
+        await client.query<{ count: string }>(
+          "SELECT COUNT(*) AS count FROM ai_concurrency_leases WHERE principal = $1",
+          [principal],
+        )
+      ).rows[0]?.count ?? 0,
+    );
+    if (active >= limit) throw new RateLimitError(10);
+    await client.query(
+      `INSERT INTO ai_concurrency_leases (lease_id, principal, expires_at)
+       VALUES ($1, $2, $3)`,
+      [leaseId, principal, now + leaseMs],
+    );
+  });
+
   let released = false;
-  return () => {
+  return async () => {
     if (released) return;
     released = true;
-    const next = Math.max(0, (activeByPrincipal.get(principal) ?? 1) - 1);
-    if (next === 0) activeByPrincipal.delete(principal);
-    else activeByPrincipal.set(principal, next);
+    await getDb().query(
+      "DELETE FROM ai_concurrency_leases WHERE lease_id = $1",
+      [leaseId],
+    );
   };
 }

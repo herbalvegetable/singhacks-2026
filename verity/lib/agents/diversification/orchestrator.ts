@@ -51,10 +51,16 @@ export interface ProgressUpdate {
 type ProgressHandler = (update: ProgressUpdate) => void | Promise<void>;
 const SUITABILITY_VERSION = "portfolio-suitability-2026.1";
 
-function confidenceCeiling(repository: Repository, clientId: string, signalId: string): number {
-  const flags = repository.getClientDataQualityFlags(clientId);
+async function confidenceCeiling(
+  repository: Repository,
+  clientId: string,
+  signalId: string,
+): Promise<number> {
+  const [flags, narratives] = await Promise.all([
+    repository.getClientDataQualityFlags(clientId),
+    repository.getNarrativesForClient(clientId),
+  ]);
   const hasLaggedMark = flags.some((flag) => flag.code === "LAGGED_PRIVATE_MARK");
-  const narratives = repository.getNarrativesForClient(clientId);
   const narrative = narratives[signalId];
   const narrativeConfidence =
     typeof narrative === "object" &&
@@ -82,17 +88,17 @@ export async function generateDiversificationPlan(
   onProgress: ProgressHandler = () => undefined,
   repository = new Repository(),
 ): Promise<DiversificationPlan> {
-  const signal = repository.getSignal(signalId);
+  const signal = await repository.getSignal(signalId);
   if (!signal) throw new Error("Signal not found");
 
   await onProgress({ stage: "retrieval", message: "Retrieving client objectives and portfolio evidence" });
-  const context = buildDiversificationContext(signal, repository);
+  const context = await buildDiversificationContext(signal, repository);
   const inputHash = createHash("sha256")
     .update(
       `${context.contextPackHash}:${ASSUMPTION_SET_VERSION}:${SUITABILITY_VERSION}`,
     )
     .digest("hex");
-  const cached = repository.getDiversificationPlan(signalId, inputHash);
+  const cached = await repository.getDiversificationPlan(signalId, inputHash);
   if (cached) {
     await onProgress({
       stage: "cached",
@@ -177,7 +183,7 @@ export async function generateDiversificationPlan(
       seed: stringSeed(`${signalId}:common-market-paths:${ASSUMPTION_SET_VERSION}`),
     }),
   );
-  const confidence = confidenceCeiling(repository, signal.client_id, signalId);
+  const confidence = await confidenceCeiling(repository, signal.client_id, signalId);
 
   const calculated = applied.map((result) => {
     const weights = allocationsFromAction(result.action);
@@ -279,7 +285,7 @@ export async function generateDiversificationPlan(
     confidence,
     generated_at: generatedAt,
   });
-  repository.saveDiversificationPlan(plan, inputHash);
+  await repository.saveDiversificationPlan(plan, inputHash);
   await onProgress({ stage: "complete", message: "Diversification analysis complete", payload: plan });
   return plan;
 }
