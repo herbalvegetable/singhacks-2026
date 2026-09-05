@@ -150,14 +150,16 @@ export default async function Home() {
                           <p className="mt-2 text-sm font-semibold leading-snug text-ink">
                             {signal.headline}
                           </p>
-                          <div className="mt-2">
-                            <SourceLineageFooter
-                              grounding={client.groundingBySignal.get(signal.signal_id)}
-                              sources={signal.evidence}
-                              window={signal.window}
-                              compact
-                            />
-                          </div>
+                          {signal.type !== "explanation" && signal.type !== "risk" && (
+                            <div className="mt-2">
+                              <SourceLineageFooter
+                                grounding={client.groundingBySignal.get(signal.signal_id)}
+                                sources={signal.evidence}
+                                window={signal.window}
+                                compact
+                              />
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))}

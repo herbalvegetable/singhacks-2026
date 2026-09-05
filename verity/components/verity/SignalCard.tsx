@@ -33,6 +33,8 @@ interface Narrative {
 }
 
 export function SignalCard({ signal, grounding }: SignalCardProps) {
+  const hideListedSources =
+    signal.type === "explanation" || signal.type === "risk";
   const [showNarrative, setShowNarrative] = useState(false);
   const [narrative, setNarrative] = useState<Narrative | null>(null);
   const [loading, setLoading] = useState(false);
@@ -135,25 +137,33 @@ export function SignalCard({ signal, grounding }: SignalCardProps) {
         </div>
       )}
 
-      <div className="mt-4 space-y-2">
-        <EvidenceDisclosure
-          sources={[...signal.evidence, ...(grounding?.source_refs ?? [])]}
-          grounding={grounding}
-        />
-      </div>
+      {(grounding || !hideListedSources) && (
+        <div className="mt-4 space-y-2">
+          <EvidenceDisclosure
+            sources={
+              hideListedSources
+                ? []
+                : [...signal.evidence, ...(grounding?.source_refs ?? [])]
+            }
+            grounding={grounding}
+          />
+        </div>
+      )}
 
       {/* Actions */}
       <div className="mt-4 flex flex-col gap-3 border-t border-white/50 pt-4 sm:flex-row sm:items-center sm:justify-between">
-        <SourceLineageFooter
-          grounding={grounding}
-          sources={signal.evidence}
-          window={signal.window}
-        />
+        {!hideListedSources && (
+          <SourceLineageFooter
+            grounding={grounding}
+            sources={signal.evidence}
+            window={signal.window}
+          />
+        )}
 
         <button
           onClick={loadNarrative}
           disabled={loading}
-          className="vibrant-button disabled:opacity-50"
+          className={`vibrant-button disabled:opacity-50${hideListedSources ? " sm:ml-auto" : ""}`}
         >
           {loading
             ? "Generating analysis..."

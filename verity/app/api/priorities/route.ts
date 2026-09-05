@@ -1,6 +1,7 @@
 import {
   buildBookRiskFacts,
   generateBookRiskPriorities,
+  generateDeterministicRiskPriorities,
   hashBookRiskFacts,
 } from "@/lib/agents/priorityAgent";
 import { Repository } from "@/lib/db/repository";
@@ -66,7 +67,6 @@ export async function POST(request: NextRequest) {
       return Response.json({ error: "Forbidden" }, { status: 403 });
     }
     releaseConcurrency = await acquireConcurrency(`priorities:${session.rmId}`, 1);
-    await reserveDailyAiBudget(session.rmId, 24_000);
     const repository = new Repository();
     const facts = await buildBookRiskFacts(repository, session.rmId);
     const inputHash = hashBookRiskFacts(facts);
@@ -78,20 +78,35 @@ export async function POST(request: NextRequest) {
       return Response.json({ priorities: cached, generated: false });
     }
 
-    const { priorities } = await generateBookRiskPriorities(repository, facts);
+    let priorities;
+    let generatedBy: "gpt-4o" | "deterministic" = "gpt-4o";
+    try {
+      await reserveDailyAiBudget(session.rmId, 24_000);
+      ({ priorities } = await generateBookRiskPriorities(repository, facts));
+    } catch (error) {
+      generatedBy = "deterministic";
+      console.error(
+        "AI risk prioritization failed; using deterministic scoring:",
+        error,
+      );
+      priorities = generateDeterministicRiskPriorities(facts);
+    }
     await repository.saveRiskPriorities(priorities);
     await writeSecurityAuditEvent({
       rmId: session.rmId,
       eventType: "model_response",
       target: "risk_priorities",
       metadata: {
-        model: "gpt-4o",
-        prompt_version: "risk-priority-v1",
+        model: generatedBy,
+        prompt_version:
+          generatedBy === "gpt-4o"
+            ? "risk-priority-v1"
+            : "risk-priority-deterministic-v1",
         estimated_tokens_reserved: 24_000,
         priority_count: priorities.length,
       },
     });
-    return Response.json({ priorities, generated: true });
+    return Response.json({ priorities, generated: true, generated_by: generatedBy });
   } catch (error) {
     const securityResponse = securityErrorResponse(error);
     if (securityResponse) return securityResponse;

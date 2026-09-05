@@ -34,7 +34,11 @@ function testRepository(): Repository {
 
 test("builds complete, de-identified and reproducibly hashed book risk facts", async () => {
   process.env.OPENAI_API_KEY ||= "test-key";
-  const { buildBookRiskFacts, hashBookRiskFacts } = await import(
+  const {
+    buildBookRiskFacts,
+    generateDeterministicRiskPriorities,
+    hashBookRiskFacts,
+  } = await import(
     "../../lib/agents/priorityAgent"
   );
   const facts = await buildBookRiskFacts(testRepository());
@@ -48,4 +52,14 @@ test("builds complete, de-identified and reproducibly hashed book risk facts", a
   assert.ok(facts.every((fact) => !("client_name" in fact.profile)));
   assert.equal(hashBookRiskFacts(facts), hashBookRiskFacts(facts));
   assert.match(hashBookRiskFacts(facts), /^[a-f0-9]{64}$/);
+  const priorities = generateDeterministicRiskPriorities(facts);
+  assert.equal(priorities.length, facts.length);
+  assert.ok(
+    priorities.every(
+      (priority, index) =>
+        priority.rank === index + 1 &&
+        priority.evidence_ref_ids.length > 0 &&
+        priority.dimensions.length === 5,
+    ),
+  );
 });

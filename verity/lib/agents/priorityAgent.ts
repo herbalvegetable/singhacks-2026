@@ -222,6 +222,144 @@ export function hashBookRiskFacts(facts: ClientRiskFacts[]): string {
     .digest("hex");
 }
 
+function deterministicSeverity(score: number) {
+  if (score >= 75) return "critical" as const;
+  if (score >= 55) return "high" as const;
+  if (score >= 30) return "moderate" as const;
+  return "low" as const;
+}
+
+export function generateDeterministicRiskPriorities(
+  facts: ClientRiskFacts[],
+): StoredRiskPriority[] {
+  const inputHash = hashBookRiskFacts(facts);
+  const generatedAt = new Date().toISOString();
+  const assessments = facts.map((fact) => {
+    const signalScore = fact.deterministic_metrics.max_urgency;
+    const concentrationScore = Math.min(
+      100,
+      fact.deterministic_metrics.largest_holding_pct * 2,
+    );
+    const nearestCashNeed = Math.min(
+      ...fact.cash_needs.map((need) =>
+        typeof need.days_until_due_from === "number"
+          ? need.days_until_due_from
+          : Number.POSITIVE_INFINITY,
+      ),
+    );
+    const liquidityScore =
+      nearestCashNeed <= 30
+        ? 85
+        : nearestCashNeed <= 90
+          ? 60
+          : fact.commitments.length > 0
+            ? 35
+            : 10;
+    const creditScore = fact.credit_facilities.reduce((highest, facility) => {
+      const ltv = Number(facility.latest_ltv_pct);
+      const trigger = Number(facility.margin_call_ltv_pct);
+      if (!Number.isFinite(ltv) || !Number.isFinite(trigger) || trigger <= 0) {
+        return highest;
+      }
+      return Math.max(highest, Math.min(100, (ltv / trigger) * 100));
+    }, 0);
+    const dataScore = fact.data_quality_flags.some(
+      (flag) => flag.severity === "error",
+    )
+      ? 75
+      : fact.data_quality_flags.length > 0
+        ? 45
+        : 5;
+    const riskScore = Math.max(
+      1,
+      Math.min(
+        100,
+        Math.round(
+          signalScore * 0.35 +
+            concentrationScore * 0.25 +
+            liquidityScore * 0.15 +
+            creditScore * 0.15 +
+            dataScore * 0.1,
+        ),
+      ),
+    );
+    const dimensions = [
+      {
+        dimension: "signal_severity" as const,
+        score: signalScore,
+        rationale: `${fact.deterministic_metrics.signal_count} active signals; maximum urgency ${signalScore}.`,
+      },
+      {
+        dimension: "liquidity_deadlines" as const,
+        score: liquidityScore,
+        rationale: Number.isFinite(nearestCashNeed)
+          ? `Nearest planned cash need is in ${nearestCashNeed} days.`
+          : `${fact.commitments.length} outstanding commitment records and no dated cash need.`,
+      },
+      {
+        dimension: "concentration" as const,
+        score: concentrationScore,
+        rationale: `Largest household position is ${fact.deterministic_metrics.largest_holding_pct}%${fact.deterministic_metrics.largest_holding_name ? ` in ${fact.deterministic_metrics.largest_holding_name}` : ""}.`,
+      },
+      {
+        dimension: "credit_margin" as const,
+        score: creditScore,
+        rationale:
+          fact.credit_facilities.length > 0
+            ? `Highest current LTV uses ${Math.round(creditScore)}% of its margin-call threshold.`
+            : "No credit facility exposure is recorded.",
+      },
+      {
+        dimension: "data_uncertainty" as const,
+        score: dataScore,
+        rationale: `${fact.data_quality_flags.length} relevant data-quality flags.`,
+      },
+    ];
+    const keyRisks = dimensions
+      .filter((dimension) => dimension.score >= 30)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 3)
+      .map((dimension) => dimension.rationale);
+    return {
+      client_id: fact.client_id,
+      risk_score: riskScore,
+      attention_band:
+        riskScore >= 75
+          ? "call_today" as const
+          : riskScore >= 40
+            ? "this_week" as const
+            : "monitor" as const,
+      rationale: `Deterministic score based on signal urgency, concentration, liquidity, credit, and data quality.`,
+      dimensions: dimensions.map(({ dimension, score, rationale }) => ({
+        dimension,
+        severity: deterministicSeverity(score),
+        rationale,
+      })),
+      evidence_ref_ids: fact.valid_evidence_ref_ids.slice(0, 12),
+      confidence: fact.data_quality_flags.length > 0 ? 70 : 85,
+      risk_summary:
+        keyRisks[0] ??
+        "No strong evidence of immediate portfolio attention was identified.",
+      key_risks: keyRisks,
+      uncertainty:
+        fact.data_quality_flags.length > 0
+          ? "Data-quality flags reduce scoring confidence."
+          : null,
+      input_hash: inputHash,
+      generated_at: generatedAt,
+    };
+  });
+  return assessments
+    .sort(
+      (left, right) =>
+        right.risk_score - left.risk_score ||
+        left.client_id.localeCompare(right.client_id),
+    )
+    .map((priority, index) =>
+      StoredRiskPriority.parse({ ...priority, rank: index + 1 }),
+    );
+}
+
 function requireCompleteClientSet<T extends { client_id: string }>(
   values: T[],
   facts: ClientRiskFacts[],
