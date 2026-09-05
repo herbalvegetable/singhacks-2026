@@ -1,0 +1,11 @@
+singhacks-jb-wealth-intelligence/
+.cursor/
+verity-spec/
+verity-planning-prompt.md
+**/.env*
+!**/.env.example
+**/node_modules/
+**/.next/
+**/*.db
+**/*.db-*
+**/coverage/
