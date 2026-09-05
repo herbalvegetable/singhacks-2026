@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  AuthConfigurationError,
   authenticateCredentials,
   createSession,
 } from "@/lib/security/auth";
@@ -28,16 +27,6 @@ export async function POST(request: NextRequest) {
     });
     const input = LoginRequest.parse(await request.json());
     const identity = authenticateCredentials(input.username, input.password);
-    if (!identity) {
-      await writeSecurityAuditEvent({
-        eventType: "authentication_failed",
-        target: "login",
-      });
-      return NextResponse.json(
-        { error: "Invalid username or password" },
-        { status: 401 },
-      );
-    }
     await createSession(identity);
     await writeSecurityAuditEvent({
       rmId: identity.rmId,
@@ -51,13 +40,6 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     const securityResponse = securityErrorResponse(error);
     if (securityResponse) return securityResponse;
-    if (error instanceof AuthConfigurationError) {
-      console.error("Authentication configuration is incomplete");
-      return NextResponse.json(
-        { error: "Authentication is unavailable" },
-        { status: 503 },
-      );
-    }
     if (error instanceof z.ZodError) {
       return NextResponse.json(
         { error: "Invalid login request" },
