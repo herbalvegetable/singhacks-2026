@@ -741,7 +741,7 @@ Verity is a functional hackathon pilot, not a production banking system.
 
 ## Product thesis
 
-The winning wealth-intelligence experience is not the one that generates the most text. It is the one an RM can inspect, challenge, and responsibly stand behind.
+The best wealth-intelligence experience is not the one that generates the most text. It is the one an RM can inspect, challenge, and responsibly stand behind.
 
 Verity's core design choice is therefore simple:
 
